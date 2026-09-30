@@ -53,3 +53,4 @@ build-vision.bat
 /.rocm-win/
 # Generated conversation snapshots, wherever the disk cache is configured
 strata-conversations-v1/
+strata-conversations-v2/
