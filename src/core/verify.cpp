@@ -135,6 +135,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
