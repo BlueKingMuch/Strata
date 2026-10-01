@@ -1,5 +1,6 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/progress.hpp"
 
 #include "strata/kernels/qsa.hpp"
@@ -879,6 +880,8 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         return false;
     }
     const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
+    tg.scratch_bytes = graph_scratch_bytes(graph);   // Windows HIP; 0 elsewhere (device.hpp)
+    tg.scratch_stream = nullptr;
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
@@ -896,6 +899,15 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     if (!tg.captured) { err = "session_run_token: not captured"; return false; }
     if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
+    // Windows HIP: the scratch the graph's kernels need, allocated before its first launch on this stream, while no
+    // kernel waits for this thread - grown inside the launch, it would wait for the graph's own doorbell waits
+    if (tg.scratch_bytes > 0 && tg.scratch_stream != (const void*) cs) {
+        if (!reserve_scratch(tg.scratch_bytes, (void*) cs, err)) {
+            err = "session_run_token: " + err;
+            return false;
+        }
+        tg.scratch_stream = (const void*) cs;
+    }
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
     doorbell_reset(*s.db);

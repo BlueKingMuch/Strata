@@ -402,6 +402,8 @@ struct TokenGraph {
     double ms_wait = 0;              ///< host waiting for rings (the GPU is running)
     double ms_pool = 0;              ///< host inside the pool
     int64_t flushes = 0;             ///< cudaStreamQuery calls made because a ring was slow to appear
+    size_t scratch_bytes = 0;        ///< Windows HIP: private memory per thread its kernels need (device.hpp)
+    const void* scratch_stream = nullptr;   ///< the stream that much was reserved on, before its first launch there
 };
 
 /// Plan v0.3 P4: the VRAM expert tier inside the token graph.  Residency is STATIC during a token (a

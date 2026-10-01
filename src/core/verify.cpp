@@ -4,6 +4,7 @@
 #include <intrin.h>
 #endif
 
+#include "strata/core/device.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -928,15 +929,32 @@ bool Verifier::capture(int T, std::string& err) {
     }
 #endif
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    int unknown = 0;
+    const size_t scratch = graph_scratch_bytes(graph, &unknown);   // Windows HIP; 0 elsewhere (device.hpp)
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
         return false;
     }
+    // Windows HIP: the scratch the window's kernels need, allocated now, while no kernel waits for this thread.
+    // Grown inside the launch instead, the runtime would first wait for the window's own flag waits (device.hpp).
+    size_t reserved = 0;
+    std::string serr;
+    if (!reserve_scratch(scratch, cs_, serr, &reserved)) {
+        err = "verify: " + serr;
+        return false;
+    }
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    char note[192] = "";
+    if (scratch > 0 || unknown > 0)
+        std::snprintf(note, sizeof note, "; its kernels need %zu B of scratch per thread, %zu B reserved%s", scratch,
+                      reserved,
+                      reserved < scratch ? " - LESS, the first launch can hang"
+                      : unknown > 0      ? ", the need of some kernels unreadable"
+                                         : "");
+    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s%s)\n", T,
+                 cudaGetErrorString(ue), cudaGetErrorString(us), note);
     return true;
 }
 

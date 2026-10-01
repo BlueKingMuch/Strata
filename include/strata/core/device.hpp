@@ -11,6 +11,7 @@
 // startup so the discrepancy is visible immediately.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,17 @@ std::string gpu_arch_problem(int ordinal);
 
 // The GPU architectures this binary was compiled for ("gfx1100,gfx1201"); "" on CUDA builds.
 const char* compiled_gpu_archs();
+
+// Windows HIP builds: the private memory ("scratch") per thread that the kernels of a captured graph need - the most
+// any of its kernel nodes needs (`unknown`: kernel nodes whose need could not be read) - and a launch on `stream`
+// that has the runtime allocate at least that much now.  The Windows runtime sizes its scratch buffer while it
+// ENQUEUES a kernel, and before it grows the buffer it waits until the GPU has finished the work in flight that
+// used the old one.  A graph whose kernels wait on the GPU for the CPU (a verify window, the token graph) then
+// hangs in its own launch: the GPU waits for a flag the CPU raises only once the launch has returned (RX 6800, HIP
+// SDK 7.2: the first verify window of a process).  The buffer only grows, so reserving once per stream before the
+// first launch, while nothing waits, is enough.  CUDA and Linux HIP builds: 0, and no launch.
+size_t graph_scratch_bytes(void* graph, int* unknown = nullptr);
+bool reserve_scratch(size_t bytes_per_thread, void* stream, std::string& err, size_t* reserved = nullptr);
 
 // Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
 // run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and

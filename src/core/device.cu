@@ -3,8 +3,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_set>
+#include <vector>
 
 namespace strata::core {
 
@@ -72,6 +76,116 @@ const char* compiled_gpu_archs() {
     return "";
 #endif
 }
+
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+namespace {
+// N ints of private memory per thread: volatile and indexed at run time, so they stay in scratch at every optimization
+// level.  `out` is never written (the launch passes i = 1).  Its few registers let the runtime size the buffer for
+// the most waves per CU, so it covers any kernel that needs no more private memory per thread.
+template <int N> __global__ void scratch_reserve_kernel(int i, int* out) {
+    volatile int buf[N];
+    buf[i & (N - 1)] = i;
+    if (i < 0) *out = buf[(i + 1) & (N - 1)];
+}
+constexpr int kReserveSizes = 6;   // 8 .. 256 ints: 32 B .. 1 KiB per thread
+const void* reserve_fn(int k) {
+    switch (k) {
+    case 0: return (const void*) scratch_reserve_kernel<8>;
+    case 1: return (const void*) scratch_reserve_kernel<16>;
+    case 2: return (const void*) scratch_reserve_kernel<32>;
+    case 3: return (const void*) scratch_reserve_kernel<64>;
+    case 4: return (const void*) scratch_reserve_kernel<128>;
+    default: return (const void*) scratch_reserve_kernel<256>;
+    }
+}
+void reserve_launch(int k, hipStream_t s) {
+    switch (k) {
+    case 0: scratch_reserve_kernel<8><<<1, 32, 0, s>>>(1, nullptr); break;
+    case 1: scratch_reserve_kernel<16><<<1, 32, 0, s>>>(1, nullptr); break;
+    case 2: scratch_reserve_kernel<32><<<1, 32, 0, s>>>(1, nullptr); break;
+    case 3: scratch_reserve_kernel<64><<<1, 32, 0, s>>>(1, nullptr); break;
+    case 4: scratch_reserve_kernel<128><<<1, 32, 0, s>>>(1, nullptr); break;
+    default: scratch_reserve_kernel<256><<<1, 32, 0, s>>>(1, nullptr); break;
+    }
+}
+}  // namespace
+
+size_t graph_scratch_bytes(void* graph, int* unknown) {
+    if (unknown != nullptr) *unknown = 0;
+    size_t n = 0;
+    if (graph == nullptr || hipGraphGetNodes((hipGraph_t) graph, nullptr, &n) != hipSuccess || n == 0) {
+        (void) hipGetLastError();
+        return 0;
+    }
+    std::vector<hipGraphNode_t> nodes(n);
+    if (hipGraphGetNodes((hipGraph_t) graph, nodes.data(), &n) != hipSuccess) {
+        (void) hipGetLastError();
+        return 0;
+    }
+    std::unordered_set<const void*> seen;   // a window launches the same few dozen kernels in every layer
+    size_t most = 0;
+    for (size_t i = 0; i < n; ++i) {
+        hipGraphNodeType type;
+        if (hipGraphNodeGetType(nodes[i], &type) != hipSuccess || type != hipGraphNodeTypeKernel) continue;
+        hipKernelNodeParams p{};
+        if (hipGraphKernelNodeGetParams(nodes[i], &p) != hipSuccess || p.func == nullptr) {
+            if (unknown != nullptr) ++*unknown;
+            continue;
+        }
+        if (!seen.insert(p.func).second) continue;
+        hipFuncAttributes a{};
+        if (hipFuncGetAttributes(&a, p.func) != hipSuccess) {
+            if (unknown != nullptr) ++*unknown;
+            continue;
+        }
+        most = std::max(most, (size_t) a.localSizeBytes);
+    }
+    (void) hipGetLastError();   // a failed lookup leaves no error behind for the next launch to report
+    return most;
+}
+
+bool reserve_scratch(size_t bytes_per_thread, void* stream, std::string& err, size_t* reserved) {
+    if (reserved != nullptr) *reserved = 0;
+    // STRATA_SCRATCH_RESERVE=0: no reserve (the A/B; a window whose kernels need more scratch than anything run
+    // before then hangs in its first launch)
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_SCRATCH_RESERVE");
+        return v != nullptr && std::atoi(v) == 0;
+    }();
+    if (bytes_per_thread == 0 || off) return true;
+    int k = 0;
+    size_t have = 0;
+    for (; k < kReserveSizes; ++k) {   // the smallest reserve kernel that needs at least as much
+        hipFuncAttributes a{};
+        if (hipFuncGetAttributes(&a, reserve_fn(k)) != hipSuccess) {
+            (void) hipGetLastError();
+            continue;
+        }
+        have = (size_t) a.localSizeBytes;
+        if (have >= bytes_per_thread) break;
+    }
+    if (k == kReserveSizes) k = kReserveSizes - 1;   // more than 1 KiB per thread: the largest, and the caller says so
+    reserve_launch(k, (hipStream_t) stream);
+    hipError_t e = hipGetLastError();
+    if (e == hipSuccess) e = hipStreamSynchronize((hipStream_t) stream);
+    if (e != hipSuccess) {
+        err = std::string("reserving ") + std::to_string(bytes_per_thread) + " B of scratch per thread: " +
+              hipGetErrorString(e);
+        return false;
+    }
+    if (reserved != nullptr) *reserved = have;
+    return true;
+}
+#else
+size_t graph_scratch_bytes(void*, int* unknown) {
+    if (unknown != nullptr) *unknown = 0;
+    return 0;
+}
+bool reserve_scratch(size_t, void*, std::string&, size_t* reserved) {
+    if (reserved != nullptr) *reserved = 0;
+    return true;
+}
+#endif
 
 std::string gpu_arch_problem(int ordinal) {
 #if defined(STRATA_USE_HIP)
