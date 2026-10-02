@@ -456,14 +456,14 @@ constexpr size_t kAssetRead = size_t(8) << 20;
 
 ConversationDigest hash_asset_piece(const std::filesystem::path& path, uint64_t offset, uint64_t count,
                                     std::vector<char>& buffer) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open identity asset: " + path.string());
-    if (offset && !f.seekg(std::streamoff(offset))) throw std::runtime_error("cannot read identity asset: " + path.string());
+    InputFile f(path);   // one fread per 8 MiB, not std::ifstream's 4 KiB reads (see InputFile)
+    if (!f.is_open()) throw std::runtime_error("cannot open identity asset: " + path.string());
     Digest piece;
     while (count) {
         const size_t n = size_t(std::min<uint64_t>(count, buffer.size()));
-        if (!f.read(buffer.data(), std::streamsize(n))) throw std::runtime_error("cannot read identity asset: " + path.string());
+        if (!f.read(offset, buffer.data(), n)) throw std::runtime_error("cannot read identity asset: " + path.string());
         piece.update(buffer.data(), n);
+        offset += n;
         count -= n;
     }
     return piece.finish();
