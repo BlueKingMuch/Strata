@@ -12,7 +12,8 @@
 //   gdn_rec_parity --bench    and the timings at T = 8192 and 32768 (one layer, all 48 value heads); the two
 //                             variants' launches alternate, since a card under load steps its clock down after a
 //                             fraction of a second (see native_grouped_parity); then both at 1 to 6 blocks per
-//                             SM, as on cards with more or fewer SMs (scale)
+//                             SM, as on cards with more or fewer SMs (scale), and both with the engine's grids on
+//                             32 to all of this card's SMs, the others held by a sleeping kernel (fewer_sms)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -21,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace {
@@ -313,6 +315,65 @@ __global__ void count_diff(const uint32_t* a, const uint32_t* b, int64_t n, unsi
     if (d) atomicAdd(out, d);
 }
 
+// ------------------------------------------------------------------ holding SMs (fewer_sms)
+__device__ __forceinline__ uint64_t gtime() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ int sm_id() {
+    unsigned id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+    return (int) id;
+}
+__device__ __forceinline__ void nap(unsigned ns) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __nanosleep(ns);
+#else
+    (void) ns;
+#endif
+}
+// limits that a run that works never reaches (a launch here takes milliseconds); they keep a run that does not work
+// from waiting forever, and the host drops its time
+constexpr uint64_t kHoldLimitNs = 1000000000ull, kWaitLimitNs = 500000000ull;
+// One block per SM: it asks for all the shared memory a block may have (launched with that much dynamic shared
+// memory), so no block of another kernel fits beside it.  It notes its SM and sleeps until release says gen.
+__global__ void hold_sm(unsigned long long* sitting, const volatile unsigned* release, unsigned gen, int* where,
+                        unsigned* late) {
+    where[blockIdx.x] = sm_id();
+    __threadfence();
+    atomicAdd(sitting, 1ull);
+    const uint64_t t0 = gtime();
+    while (*release != gen) {
+        if (gtime() - t0 > kHoldLimitNs) { atomicAdd(late, 1u); return; }
+        nap(20000);
+    }
+}
+// on the timed launch's stream, before it: returns once all holding blocks so far sit on their SMs
+__global__ void wait_sitting(const volatile unsigned long long* sitting, unsigned long long all, unsigned* late) {
+    const uint64_t t0 = gtime();
+    while (*sitting < all) {
+        if (gtime() - t0 > kWaitLimitNs) { atomicAdd(late, 1u); return; }
+        nap(1000);
+    }
+}
+__global__ void release_sms(volatile unsigned* release, unsigned gen) { *release = gen; }
+// Where the blocks of a grid land: launched like the recurrence it stands for (the same grid and block size, and as
+// much dynamic shared memory as lets as many blocks share an SM), every block notes its SM and stays until all of them
+// have landed, so they all sit at once as the recurrence's blocks do for the whole chunk.
+__global__ void land(int* where, unsigned* landed, unsigned* apart) {
+    extern __shared__ unsigned char land_smem[];   // only its size matters
+    if (threadIdx.x != 0 || threadIdx.y != 0) return;
+    where[blockIdx.x] = sm_id();
+    atomicAdd(landed, 1u);
+    const uint64_t t0 = gtime();
+    while (*(volatile unsigned*) landed < gridDim.x) {
+        if (gtime() - t0 > kWaitLimitNs) { atomicAdd(apart, 1u); return; }   // they did not all fit at once
+        nap(1000);
+    }
+    (void) land_smem;
+}
+
 template <typename T> T* dalloc(size_t n) {
     T* p = nullptr;
     ck(cudaMalloc((void**) &p, n * sizeof(T) + 16), "cudaMalloc");
@@ -559,6 +620,247 @@ void scale(int64_t T) {
     cudaEventDestroy(e1);
 }
 
+// The engine's grids on N of this card's SMs.  scale() puts as many blocks on every SM as the busiest SM of a card with
+// N SMs gets; on that card only some SMs get that many (192 blocks on 80 SMs: 3 on 32 SMs, 2 on the other 48), the
+// rest of the card has less to do, and the estimate came out 4-9 % above the real launch on two cards.  Here the
+// recurrences run as the engine launches them, while hold_sm keeps all but N SMs: its blocks go out first, a small
+// kernel on the timed launch's stream waits until they all sit, and one after the timed launch lets them go.  land()
+// shows for every N where the two grids land: none on a held SM, and how many blocks share the busiest SM.  The
+// recurrences are the ones above, unchanged; L2, memory and clock stay this card's.
+void fewer_sms(int64_t T) {
+    int dev = 0, sms = 0, optin = 0, smem_sm = 0, reserved = 0, hold_per_sm = 0, per_sm[kRecCount] = {};
+    ck(cudaGetDevice(&dev), "device");
+    ck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SMs");
+    ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory");
+    ck(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev), "shared memory");
+    ck(cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev), "shared memory");
+    for (const void* f : {(const void*) hold_sm, (const void*) land}) {
+        ck(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, optin), "shared memory");
+        ck(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared),
+           "carveout");
+    }
+    // Loaded now rather than at a first launch: with lazy loading (CUDA 12's default) a kernel's first launch may wait
+    // until the device is idle, and so for hold_sm, which waits for release_sms.
+    cudaFuncAttributes fa[kRecCount], fx;
+    ck(cudaFuncGetAttributes(&fa[kBefore], gdn_rec_cols_pipe_kernel), "attributes");
+    ck(cudaFuncGetAttributes(&fa[kKeyHead], gdn_rec_kh_kernel), "attributes");
+    for (const void* f : {(const void*) hold_sm, (const void*) wait_sitting, (const void*) release_sms, (const void*) land})
+        ck(cudaFuncGetAttributes(&fx, f), "attributes");
+    ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&hold_per_sm, hold_sm, 1, optin), "occupancy");
+    ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm[kBefore], gdn_rec_cols_pipe_kernel, CB * RG, 0), "occupancy");
+    ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm[kKeyHead], gdn_rec_kh_kernel, CB * RG, 0), "occupancy");
+    const int grid[kRecCount] = {HV * NCB, HK * NCB};   // as the engine launches them
+    std::printf("  the engine's grids on N of this card's %d SMs (%lld tokens; the other SMs held by a sleeping kernel, see "
+                "fewer_sms):\n", sms, (long long) T);
+    const int left = smem_sm - optin - reserved;   // shared memory a holding block leaves on its SM
+    if (hold_per_sm != 1 || (int) fa[kBefore].sharedSizeBytes + reserved <= left ||
+        (int) fa[kKeyHead].sharedSizeBytes + reserved <= left) {
+        std::printf("    not on this card: a block of a recurrence would fit beside a holding block (%d bytes left)\n",
+                    left);
+        return;
+    }
+    // land(): as much dynamic shared memory as still lets as many of its blocks share an SM as of the recurrence
+    int land_smem[kRecCount];
+    for (int v = 0; v < kRecCount; ++v) {
+        int lo = 0, hi = optin;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) / 2;
+            int nb = 0;
+            ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, land, CB * RG, mid), "occupancy");
+            if (nb >= per_sm[v]) lo = mid;
+            else hi = mid - 1;
+        }
+        land_smem[v] = lo;
+    }
+    // N: all SMs, and below that the SM counts of cards and the band edges, as long as both grids fit at once
+    std::vector<int> ns = {sms};
+    for (const int n : {170, 144, 132, 128, 112, 108, 96, 95, 84, 82, 80, 76, 72, 70, 66, 64, 63, 60, 56, 52, 48, 47, 46, 44,
+                        40, 39, 38, 36, 34, 32})
+        if (n < sms && (int64_t) n * per_sm[kBefore] >= grid[kBefore] && (int64_t) n * per_sm[kKeyHead] >= grid[kKeyHead])
+            ns.push_back(n);
+
+    Inputs in(T, 0xD5);
+    const size_t st = (size_t) S * HV * S, oc_n = (size_t) T * HV * S;
+    float* state = dalloc<float>(st);
+    float* oc = dalloc<float>(oc_n);
+    unsigned long long* sitting = dalloc<unsigned long long>(1);
+    unsigned* flags = dalloc<unsigned>(4);
+    unsigned *release = flags, *late = flags + 1, *landed = flags + 2, *apart = flags + 3;
+    int* where = dalloc<int>((size_t) sms + grid[kBefore]);   // the holding blocks' SMs, then land()'s
+    ck(cudaMemset(sitting, 0, sizeof(*sitting)), "memset");
+    ck(cudaMemset(flags, 0, 4 * sizeof(unsigned)), "memset");
+    cudaStream_t s_hold, s_run;
+    ck(cudaStreamCreateWithFlags(&s_hold, cudaStreamNonBlocking), "stream");
+    ck(cudaStreamCreateWithFlags(&s_run, cudaStreamNonBlocking), "stream");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    unsigned long long all = 0;   // holding blocks launched so far: sitting counts every one that sat down
+    unsigned gen = 0;
+    auto hold = [&](int n) {   // all but n SMs, before the next launch on s_run
+        if (n >= sms) return;
+        ++gen;
+        all += (unsigned long long) (sms - n);
+        hold_sm<<<sms - n, 1, optin, s_hold>>>(sitting, release, gen, where, late);
+        ck(cudaGetLastError(), "hold_sm");
+        const cudaError_t q = cudaStreamQuery(s_hold);   // hands the launch to the GPU now (Windows collects launches)
+        if (q != cudaErrorNotReady) ck(q, "hold_sm");
+        (void) cudaGetLastError();   // not ready is no error
+        wait_sitting<<<1, 1, 0, s_run>>>(sitting, all, late);
+    };
+    auto let_go = [&](int n) {
+        if (n < sms) release_sms<<<1, 1, 0, s_run>>>(release, gen);
+    };
+    auto settle = [&](const char* what) {
+        ck(cudaStreamSynchronize(s_run), what);
+        ck(cudaStreamSynchronize(s_hold), what);
+    };
+    auto count = [&](const unsigned* c) {   // after settle()
+        unsigned h = 0;
+        ck(cudaMemcpy(&h, c, sizeof(h), cudaMemcpyDeviceToHost), "count");
+        return h;
+    };
+    auto done = [&] {
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaStreamDestroy(s_hold);
+        cudaStreamDestroy(s_run);
+        cudaFree(state); cudaFree(oc); cudaFree(sitting); cudaFree(flags); cudaFree(where);
+    };
+
+    // where the grids land, once per N
+    struct Landing { bool held = true; int busiest[kRecCount] = {}, on[kRecCount] = {}; };
+    std::vector<Landing> lands(ns.size());
+    for (size_t i = 0; i < ns.size(); ++i) {
+        const int n = ns[i];
+        for (int v = 0; v < kRecCount; ++v) {
+            bool sat = false;
+            unsigned apart0 = 0;
+            for (int attempt = 0; attempt < 2 && !sat; ++attempt) {
+                const unsigned late0 = count(late);
+                apart0 = count(apart);
+                ck(cudaMemsetAsync(landed, 0, sizeof(unsigned), s_run), "memset");
+                hold(n);
+                land<<<grid[v], dim3(CB, RG), land_smem[v], s_run>>>(where + sms, landed, apart);
+                ck(cudaGetLastError(), "land");
+                let_go(n);
+                settle("land");
+                sat = count(late) == late0;
+            }
+            if (!sat) {   // twice: the holding kernel and the launches beside it do not run at the same time here
+                std::printf("    not on this card: the other SMs could not be held (the kernel holding them and the "
+                            "launches beside it did not run at the same time)\n");
+                done();
+                return;
+            }
+            std::vector<int> w((size_t) sms + grid[v]);
+            ck(cudaMemcpy(w.data(), where, w.size() * sizeof(int), cudaMemcpyDeviceToHost), "where");
+            std::map<int, int> held, blocks;
+            for (int b = 0; b < (n < sms ? sms - n : 0); ++b) ++held[w[b]];
+            for (int b = 0; b < grid[v]; ++b) ++blocks[w[sms + b]];
+            bool ok = count(apart) == apart0 && (int) held.size() == (n < sms ? sms - n : 0) && (int) blocks.size() <= n;
+            int most = 0, on = 0;
+            for (const auto& sb : blocks) {
+                if (held.count(sb.first)) ok = false;
+                if (sb.second > most) { most = sb.second; on = 0; }
+                if (sb.second == most) ++on;
+            }
+            lands[i].held = lands[i].held && ok;
+            lands[i].busiest[v] = most;
+            lands[i].on[v] = on;
+        }
+    }
+
+    // the timings: every N and recurrence once per round, a different one first in each round
+    struct Case { size_t i; Rec v; };
+    std::vector<Case> cases;
+    for (size_t i = 0; i < ns.size(); ++i)
+        if (lands[i].held)
+            for (int v = 0; v < kRecCount; ++v) cases.push_back({i, (Rec) v});
+    auto run = [&](const Case& cs) {   // ms, or < 0 if the SMs were not held for the whole launch
+        const int n = ns[cs.i];
+        const unsigned late0 = count(late);
+        ck(cudaMemcpyAsync(state, in.state0, st * 4, cudaMemcpyDeviceToDevice, s_run), "state");
+        hold(n);
+        ck(cudaEventRecord(e0, s_run), "event");
+        run_rec(cs.v, state, in, oc, s_run);
+        ck(cudaEventRecord(e1, s_run), "event");
+        let_go(n);
+        settle("fewer SMs");
+        if (count(late) != late0) return -1.0f;
+        float ms = 0.0f;
+        ck(cudaEventElapsedTime(&ms, e0, e1), "event");
+        return ms;
+    };
+    const int warm = 2, rounds = 15, max_dropped = 5;
+    std::vector<std::vector<float>> t(cases.size());
+    int dropped = 0;
+    for (int r = 0; r < warm + rounds && dropped <= max_dropped; ++r)
+        for (size_t j = 0; j < cases.size() && dropped <= max_dropped; ++j) {
+            const size_t k = (r + j) % cases.size();
+            const float ms = run(cases[k]);
+            if (ms < 0.0f) ++dropped;
+            else if (r >= warm) t[k].push_back(ms);
+        }
+    if (dropped > max_dropped) {   // each such run waits for a limit of a second or so
+        std::printf("    stopped: in %d runs the other SMs were not held for the whole launch\n", dropped);
+        done();
+        return;
+    }
+    auto us = [&](size_t i, int v) {   // per token, or < 0 if not measured
+        for (size_t k = 0; k < cases.size(); ++k)
+            if (cases[k].i == i && cases[k].v == v && !t[k].empty()) return 1000.0f * median(t[k]) / (float) T;
+        return -1.0f;
+    };
+    auto blocks_on = [](char* out, size_t size, int most, int on) {
+        std::snprintf(out, size, "%d block%s on %d SM%s", most, most == 1 ? "" : "s", on, on == 1 ? "" : "s");
+    };
+    std::printf("  (medians of %d alternating runs; L2, memory and clock stay this card's)\n", rounds);
+    std::printf("      N   before: busiest SM   new: busiest SM      us per token, before -> new\n");
+    for (size_t i = 0; i < ns.size(); ++i) {
+        if (!lands[i].held) {
+            std::printf("    %3d   the other SMs were not held (a block landed on one, or a wait ran out)\n", ns[i]);
+            continue;
+        }
+        char b0[40], b1[40];
+        blocks_on(b0, sizeof b0, lands[i].busiest[kBefore], lands[i].on[kBefore]);
+        blocks_on(b1, sizeof b1, lands[i].busiest[kKeyHead], lands[i].on[kKeyHead]);
+        const float u0 = us(i, kBefore), u1 = us(i, kKeyHead);
+        if (u0 < 0.0f || u1 < 0.0f) std::printf("    %3d   %-20s %-20s not measured\n", ns[i], b0, b1);
+        else std::printf("    %3d   %-20s %-20s %.3f -> %.3f   %.2fx\n", ns[i], b0, b1, u0, u1, u0 / u1);
+    }
+    if (dropped) std::printf("    (%d runs dropped: the other SMs were not held for the whole launch)\n", dropped);
+    std::printf("  so on a card with N SMs, as measured here (the kernel before puts ceil(192 / N) blocks on the busiest SM, "
+                "gdn_rec_kh_kernel ceil(64 / N)):\n");
+    const int bands[][2] = {{96, 191}, {64, 95}, {48, 63}, {39, 47}, {32, 38}};
+    for (const auto& bd : bands) {
+        const int b0 = (192 + bd[0] - 1) / bd[0], b1 = (64 + bd[0] - 1) / bd[0];
+        float lo = 0.0f, hi = 0.0f;
+        int cnt = 0, nmin = 0, nmax = 0;
+        for (size_t i = 0; i < ns.size(); ++i) {
+            const float u0 = us(i, kBefore), u1 = us(i, kKeyHead);
+            if (ns[i] < bd[0] || ns[i] > bd[1] || u0 < 0.0f || u1 < 0.0f) continue;
+            const float x = u0 / u1;
+            if (cnt == 0 || x < lo) lo = x;
+            if (cnt == 0 || x > hi) hi = x;
+            if (cnt == 0 || ns[i] < nmin) nmin = ns[i];
+            if (cnt == 0 || ns[i] > nmax) nmax = ns[i];
+            ++cnt;
+        }
+        char range[32];
+        std::snprintf(range, sizeof range, "%d-%d SMs", bd[0], bd[1]);
+        if (cnt > 0)
+            std::printf("    %-12s before %d / new %d per SM: %.2fx to %.2fx (%d to %d SMs)\n", range, b0, b1, lo, hi, nmin,
+                        nmax);
+        else if (bd[0] > sms)
+            std::printf("    %-12s before %d / new %d per SM: more SMs than this card has (see the estimate above)\n", range,
+                        b0, b1);
+        else
+            std::printf("    %-12s before %d / new %d per SM: not measured\n", range, b0, b1);
+    }
+    done();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -577,6 +879,7 @@ int main(int argc, char** argv) {
         bench(8192);
         bench(32768);
         scale(8192);
+        fewer_sms(8192);
     }
     std::printf("gdn_rec_parity: %d failures\n", fails);
     return fails ? 1 : 0;
