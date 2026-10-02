@@ -98,12 +98,32 @@ struct IoProgress {
     void finish() { if (callback) callback(); }
 };
 
+// Large spans (state blobs, K/V segments) move in 4 MiB pieces, and one piece is hashed while the stream writes
+// or reads its neighbour, so hashing no longer adds to the time the stream needs. The bytes and the digest are the
+// same as before; only small fields still go through one piece at a time.
+constexpr size_t kPipelinePiece = size_t(4) << 20;
+
 struct Writer {
     std::ostream& stream;
     Digest digest;
     IoProgress progress;
     void bytes(const void* p, size_t n) {
         const auto* data = static_cast<const char*>(p);
+        if (n >= 2 * kPipelinePiece) {
+            std::future<bool> written;   // the previous piece; the stream is only ever used by one thread at a time
+            for (size_t done = 0; done < n;) {
+                const size_t count = std::min(n - done, kPipelinePiece);
+                digest.update(data + done, count);
+                progress.advance(count);
+                if (written.valid() && !written.get()) throw std::runtime_error("snapshot write failed");
+                written = std::async(std::launch::async, [this, at = data + done, count] {
+                    return bool(stream.write(at, std::streamsize(count)));
+                });
+                done += count;
+            }
+            if (!written.get()) throw std::runtime_error("snapshot write failed");
+            return;
+        }
         // Keep streamsize conversion bounded even for a very large snapshot.
         while (n) {
             const size_t chunk = std::min<size_t>(n, 65536);
@@ -138,6 +158,22 @@ struct Reader {
     IoProgress progress;
     void bytes(void* p, size_t n) {
         auto* data = static_cast<char*>(p);
+        if (n >= 2 * kPipelinePiece) {
+            const auto fill = [this](char* at, size_t count) { return bool(stream.read(at, std::streamsize(count))); };
+            size_t done = 0, count = kPipelinePiece;
+            if (!fill(data, count)) throw std::runtime_error("truncated snapshot");
+            while (true) {
+                const size_t next_at = done + count, next = std::min(n - next_at, kPipelinePiece);
+                std::future<bool> pending;   // the stream is only ever used by one thread at a time
+                if (next) pending = std::async(std::launch::async, fill, data + next_at, next);
+                digest.update(data + done, count);
+                progress.advance(count);
+                if (!next) break;
+                if (!pending.get()) throw std::runtime_error("truncated snapshot");
+                done = next_at; count = next;
+            }
+            return;
+        }
         while (n) {
             const size_t chunk = std::min<size_t>(n, 65536);
             if (!stream.read(data, chunk)) throw std::runtime_error("truncated snapshot");

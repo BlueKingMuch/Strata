@@ -4537,9 +4537,14 @@ int main(int argc, char** argv) {
                 if (!disk.store->encoded_size(image, file_bytes, error) ||
                     !disk.store->put(image, error, disk.protected_entry))
                     std::fprintf(stderr, "strata serve: disk cache: dropped eviction (%s)\n", error.c_str());
-                else std::fprintf(stderr, "strata serve: disk cache: spilled %zu tokens bytes=%llu in %.1f ms\n",
-                                  image.live.ids.size(), (unsigned long long) file_bytes,
-                                  std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+                else {
+                    const auto timing = disk.store->last_put_timing();
+                    std::fprintf(stderr, "strata serve: disk cache: spilled %zu tokens bytes=%llu in %.1f ms "
+                                 "(write %.0f ms, sync %.0f ms, publish %.0f ms)\n",
+                                 image.live.ids.size(), (unsigned long long) file_bytes,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - started).count(),
+                                 timing.write_ms, timing.sync_ms, timing.publish_ms);
+                }
             } catch (...) { std::fprintf(stderr, "strata serve: disk cache: dropped eviction (allocation failure)\n"); }
         };
 #endif

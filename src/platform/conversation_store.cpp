@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
@@ -127,6 +128,7 @@ struct ConversationStore::Impl {
     uint64_t budget;
     size_t slots;
     ConversationIoProgress progress;
+    ConversationStore::PutTiming last_put;
 #ifdef _WIN32
     HANDLE lock = INVALID_HANDLE_VALUE;
 #else
@@ -246,16 +248,28 @@ bool ConversationStore::put(const core::SavedConversation& image, std::string& e
         temporary.armed = true;
         FileBuffer buffer(file.get(), bytes);
         std::ostream stream(&buffer);
+        using Clock = std::chrono::steady_clock;
+        const auto ms = [](Clock::time_point from, Clock::time_point to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        const auto started = Clock::now();
         if (!conversation_file_write(stream, image, impl_->identity, error, impl_->progress)) return false;
         if (buffer.remaining()) throw std::runtime_error("snapshot encoded length differs from reservation");
+        const auto written = Clock::now();
         sync_file(file.get());
         if (std::fclose(file.release()) != 0) system_failure("close snapshot");
+        const auto synced = Clock::now();
         publish(temporary.path, target);
         temporary.path = target; // remove even a published file if directory sync fails
         sync_directory(impl_->directory);
         temporary.path.clear();
+        impl_->last_put = {ms(started, written), ms(written, synced), ms(synced, Clock::now())};
         return true;
     } catch (const std::exception& e) { error = e.what(); return false; }
+}
+
+ConversationStore::PutTiming ConversationStore::last_put_timing() const {
+    return impl_ ? impl_->last_put : PutTiming{};
 }
 
 bool ConversationStore::best(const std::vector<int64_t>& prompt, const std::vector<core::ConversationImageKey>& images,

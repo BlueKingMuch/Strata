@@ -30,6 +30,10 @@ public:
     // Exact envelope bytes, including this store's identity directory.
     bool encoded_size(const core::SavedConversation& image, uint64_t& bytes, std::string& error) const;
     bool put(const core::SavedConversation& image, std::string& error, const Candidate* protected_entry = nullptr);
+    // How the last successful put() spent its time, for the engine log: encoding (hashing and handing the bytes to
+    // the file), forcing them to the device, and publishing the file under its final name.
+    struct PutTiming { double write_ms = 0, sync_ms = 0, publish_ms = 0; };
+    PutTiming last_put_timing() const;
     bool best(const std::vector<int64_t>& prompt, const std::vector<core::ConversationImageKey>& images,
               bool cvec, uint64_t staging_limit, const std::vector<std::filesystem::path>& excluded,
               Candidate& candidate, std::string& error) const;

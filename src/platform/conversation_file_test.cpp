@@ -157,6 +157,37 @@ int main() {
         check(conversation_file_read(read,id,staging,staging+17,17,roundtrip,error), "read segmented snapshot within exact staging bound");
         check(same(segmented,roundtrip) && roundtrip.bytes() <= staging, "segmented snapshot round trip preserves payload and admission");
     }
+    {
+        // Large spans go through the pipelined writer and reader (one piece hashed while the stream moves its
+        // neighbour): a 9 MiB state blob and a 40 MiB K/V buffer of varying bytes round-trip at the computed length,
+        // and a changed byte anywhere - near the start, the middle, the end of the payload - fails the read.
+        auto large = source;
+        large.live.gdn.resize((size_t(9) << 20) + 333);
+        for (size_t i = 0; i < large.live.gdn.size(); ++i) large.live.gdn[i] = uint8_t(i * 131 + 7);
+        large.kv[1].k = {};
+        large.kv[1].k.resize((size_t(40) << 20) + 4097);
+        large.kv[1].k.visit(0, large.kv[1].k.size(), [](uint8_t* p, size_t n, size_t at) {
+            for (size_t i = 0; i < n; ++i) p[i] = uint8_t(((at + i) * 2654435761ull) >> 11);
+            return true;
+        });
+        const auto encoded = encode(large, id);
+        uint64_t predicted = 0;
+        check(conversation_file_size(large, id, predicted, error) && predicted == encoded.size(),
+              "pipelined writer writes the computed length");
+        const auto staging = integer(encoded, 48);
+        std::istringstream read(encoded, std::ios::binary);
+        SavedConversation roundtrip;
+        check(conversation_file_read(read, id, staging, staging + 17, 17, roundtrip, error) && same(large, roundtrip),
+              "large spans round-trip through the pipelined writer and reader");
+        for (const size_t at : {encoded.size() / 10, encoded.size() / 2, encoded.size() * 9 / 10, encoded.size() - 33}) {
+            auto changed = encoded;
+            changed[at] = char(changed[at] ^ 0x5a);
+            std::istringstream damaged(changed, std::ios::binary);
+            SavedConversation out;
+            check(!conversation_file_read(damaged, id, staging, staging + 17, 17, out, error),
+                  "a changed byte in a pipelined span fails the read");
+        }
+    }
     rejected(bytes, id, bound - 1);
     rejected(bytes, id, bound, bound + 16, 17);
     rejected(bytes, id, bound, std::nullopt);
