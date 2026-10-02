@@ -444,7 +444,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 // one of a token orders every read of rkv before the next token's writes, the next token's first one every read of ro
 // before the writes after it.  64 blocks instead of 192.  Per value head and column the same arithmetic in the same
 // order: the same bits (src/prefill/gdn_rec_parity.cu checks them and times the variants: 1.41x on a 4080 Super).
-// sm_80+ (gdn_keyhead_ok); STRATA_GDN_KEYHEAD=0: gdn_rec_cols_pipe_kernel.
+// sm_80+ with 32 to 47 or 64 and more SMs (gdn_keyhead_ok); STRATA_GDN_KEYHEAD=0: gdn_rec_cols_pipe_kernel.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 #define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (never launched there, see gdn_keyhead_ok)
 #else
@@ -569,8 +569,13 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
     }
 }
 // gdn_rec_kh_kernel where it pays: a CUDA card with cp.async (sm_80+) that holds all 64 of its blocks at once (each
-// walks the whole chunk, so blocks left for a second wave would double the time).  Per call, from the current device
-// (a layer split can mix cards).
+// walks the whole chunk, so blocks left for a second wave would double the time), and not with 48 to 63 SMs.  The
+// busiest SM sets the pace: from 64 SMs up this kernel has one block per SM, below that two on some SMs (1.5 times as
+// long), while the kernel before has ceil(192 / SMs); two against at most four is a draw.  With the engine's grids on
+// a 4080 SUPER held to fewer SMs (gdn_rec_parity --bench): 1.40-1.42x at 64 to 80 SMs, 1.02-1.04x at 48 to 63,
+// 1.28-1.31x at 39 to 47, 1.53-1.57x at 32 to 38; an Ampere card gained less at 82 SMs (1.28x on a 3090 against
+// 1.41x here), so 48 to 63 SMs keep the kernel before.  Per call, from the current device (a layer split can mix
+// cards).
 bool gdn_keyhead_ok() {
     static const bool off = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 0; }();
     if (off) return false;
@@ -579,13 +584,15 @@ bool gdn_keyhead_ok() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (known[dev] == 0) {
         int major = 0, sms = 0, per_sm = 0;
-        const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
-                         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0) ==
-                             cudaSuccess &&
-                         (int64_t) per_sm * sms >= (int64_t) HK * NCB;
-        if (!yes) cudaGetLastError();
-        known[dev] = yes ? 1 : 2;
+        const bool fits = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
+                          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0) ==
+                              cudaSuccess &&
+                          (int64_t) per_sm * sms >= (int64_t) HK * NCB;
+        if (!fits) cudaGetLastError();
+        // blocks on the busiest SM: one of this kernel's, or five and more of the kernel before's
+        const bool pays = fits && ((HK * NCB + sms - 1) / sms == 1 || (HV * NCB + sms - 1) / sms >= 5);
+        known[dev] = pays ? 1 : 2;
     }
     return known[dev] == 1;
 }
