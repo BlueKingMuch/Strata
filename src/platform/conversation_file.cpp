@@ -6,12 +6,18 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <exception>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 namespace strata::platform {
 namespace {
@@ -246,42 +252,114 @@ struct Probe {
 };
 } // namespace
 
+namespace {
+// An asset's digest covers every byte, like one SHA-256 over the file, but in a form all cores can compute:
+// SHA-256 over a domain tag, the file size, the piece size and the SHA-256 of each 64 MiB piece in order.
+constexpr uint64_t kAssetPiece = uint64_t(64) << 20;
+constexpr size_t kAssetRead = size_t(8) << 20;
+
+ConversationDigest hash_asset_piece(const std::filesystem::path& path, uint64_t offset, uint64_t count,
+                                    std::vector<char>& buffer) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open identity asset: " + path.string());
+    if (offset && !f.seekg(std::streamoff(offset))) throw std::runtime_error("cannot read identity asset: " + path.string());
+    Digest piece;
+    while (count) {
+        const size_t n = size_t(std::min<uint64_t>(count, buffer.size()));
+        if (!f.read(buffer.data(), std::streamsize(n))) throw std::runtime_error("cannot read identity asset: " + path.string());
+        piece.update(buffer.data(), n);
+        count -= n;
+    }
+    return piece.finish();
+}
+
+ConversationDigest asset_digest(uint64_t size, const std::vector<ConversationDigest>& pieces) {
+    Digest tree;
+    const std::string domain = "strata-asset-pieces-v1";
+    tree.update(domain.data(), domain.size());
+    for (const uint64_t n : {size, kAssetPiece}) { const auto b = little(n); tree.update(b.data(), b.size()); }
+    for (const auto& d : pieces) tree.update(d.data(), d.size());
+    return tree.finish();
+}
+} // namespace
+
 bool conversation_identity(const std::vector<ConversationAsset>& assets, const ConversationSettings& settings,
                            ConversationIdentity& identity, std::string& error) {
     try {
         ConversationIdentity result;
-        auto field = [&](const std::string& name, const ConversationDigest& digest) {
-            if (result.fields.size() == 256 || name.empty() || name.size() > 128 ||
+        auto field = [](ConversationIdentity& into, const std::string& name, const ConversationDigest& digest) {
+            if (into.fields.size() == 256 || name.empty() || name.size() > 128 ||
                 name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:-") != std::string::npos)
                 throw std::runtime_error("invalid or excessive snapshot identity fields");
-            if (std::any_of(result.fields.begin(), result.fields.end(), [&](const auto& f) { return f.name == name; }))
+            if (std::any_of(into.fields.begin(), into.fields.end(), [&](const auto& f) { return f.name == name; }))
                 throw std::runtime_error("duplicate snapshot identity field: " + name);
-            result.fields.push_back({name, digest});
+            into.fields.push_back({name, digest});
         };
         for (const auto& [name, value] : settings) {
             Digest hash; hash.update(value.data(), value.size());
-            field("runtime/" + name, hash.finish());
+            field(result, "runtime/" + name, hash.finish());
         }
-        std::array<char, 32768> buffer;
-        std::map<std::filesystem::path, ConversationDigest> contents;
+        // Hash each complete file once per startup, even when several roles
+        // share a GGUF. Never trust a file-stat-only cache across processes.
+        // The roles' names are checked before any file is read. Then the distinct files' 64 MiB pieces are hashed
+        // on all but one of the CPU's threads, so a model reads at the drive's speed, even from a single file.
+        {
+            ConversationIdentity names = result;
+            for (const auto& asset : assets) field(names, "asset/" + asset.role, {});
+        }
+        std::vector<std::filesystem::path> files;   // distinct, in the order the assets name them
+        std::vector<size_t> file_of;                 // per asset
         for (const auto& asset : assets) {
-            // Hash each complete file once per startup, even when several roles
-            // share a GGUF. Never trust a file-stat-only cache across processes.
             const auto path = std::filesystem::canonical(asset.path);
-            auto [entry, fresh] = contents.try_emplace(path);
-            if (fresh) {
-                std::ifstream f(path, std::ios::binary);
-                if (!f) throw std::runtime_error("cannot open identity asset: " + path.string());
-                Digest content;
-                while (f) {
-                    f.read(buffer.data(), buffer.size());
-                    content.update(buffer.data(), static_cast<size_t>(f.gcount()));
-                }
-                if (f.bad() || !f.eof()) throw std::runtime_error("cannot read identity asset: " + path.string());
-                entry->second = content.finish();
-            }
-            field("asset/" + asset.role, entry->second);
+            const auto at = std::find(files.begin(), files.end(), path);
+            file_of.push_back(size_t(at - files.begin()));
+            if (at == files.end()) files.push_back(path);
         }
+        struct Piece { size_t file; uint64_t offset, count; };
+        std::vector<uint64_t> sizes(files.size());
+        std::vector<std::vector<ConversationDigest>> pieces(files.size());
+        std::vector<Piece> work_list;
+        for (size_t i = 0; i < files.size(); ++i) {
+            sizes[i] = std::filesystem::file_size(files[i]);
+            pieces[i].resize(size_t((sizes[i] + kAssetPiece - 1) / kAssetPiece));
+            for (uint64_t at = 0; at < sizes[i]; at += kAssetPiece)
+                work_list.push_back({i, at, std::min(kAssetPiece, sizes[i] - at)});
+        }
+        std::vector<std::exception_ptr> failures(files.size());
+        std::mutex failure_lock;
+        std::atomic<size_t> taken{0};
+        std::atomic<bool> failed{false};
+        const auto work = [&]() noexcept {
+            std::vector<char> buffer;
+            for (size_t k; (k = taken.fetch_add(1)) < work_list.size();) {
+                const Piece& piece = work_list[k];
+                if (failed.load(std::memory_order_relaxed)) continue;
+                try {
+                    if (buffer.empty()) buffer.resize(kAssetRead);
+                    pieces[piece.file][size_t(piece.offset / kAssetPiece)] =
+                        hash_asset_piece(files[piece.file], piece.offset, piece.count, buffer);
+                } catch (...) {
+                    const std::lock_guard<std::mutex> hold(failure_lock);
+                    if (!failures[piece.file]) failures[piece.file] = std::current_exception();
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            }
+        };
+        {
+            const unsigned cpus = std::thread::hardware_concurrency();
+            const size_t count = std::max<size_t>(1, std::min<size_t>(work_list.size(), cpus > 1 ? cpus - 1 : 1));
+            std::vector<std::thread> workers;
+            try {
+                for (size_t w = 1; w < count; ++w) workers.emplace_back(work);
+            } catch (const std::system_error&) {}   // fewer threads: this one takes what is left
+            work();
+            for (auto& t : workers) t.join();
+        }
+        for (const auto& failure : failures)
+            if (failure) std::rethrow_exception(failure);   // the first file the assets name that failed
+        std::vector<ConversationDigest> digests(files.size());
+        for (size_t i = 0; i < files.size(); ++i) digests[i] = asset_digest(sizes[i], pieces[i]);
+        for (size_t a = 0; a < assets.size(); ++a) field(result, "asset/" + assets[a].role, digests[file_of[a]]);
         Digest hash;
         const std::string domain = "strata-conversation-state-v2";
         hash.update(domain.data(), domain.size());

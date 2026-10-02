@@ -4508,8 +4508,12 @@ int main(int argc, char** argv) {
                 strata::platform::ConversationIdentity identity;
                 std::string disk_error;
                 std::fprintf(stderr, "strata serve: disk cache: hashing complete model assets and runtime identity\n");
-                if (!strata::platform::conversation_identity(assets, settings, identity, disk_error) ||
-                    !conversation_disk.open(o.conversation_disk, identity, uint64_t(o.conversation_disk_mib) * 1024 * 1024,
+                const auto hashing_started = Clock::now();
+                if (!strata::platform::conversation_identity(assets, settings, identity, disk_error))
+                    throw std::runtime_error(disk_error);
+                std::fprintf(stderr, "strata serve: disk cache: identity hashed in %.1f s\n",
+                             std::chrono::duration<double>(Clock::now() - hashing_started).count());
+                if (!conversation_disk.open(o.conversation_disk, identity, uint64_t(o.conversation_disk_mib) * 1024 * 1024,
                                             size_t(o.conversation_disk_slots), disk_error,
                                             []() noexcept { strata::core::progress_beat(); }))
                     throw std::runtime_error(disk_error);

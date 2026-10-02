@@ -284,6 +284,36 @@ int main() {
     check(conversation_identity({}, {{"settings", "fixture-settings"}}, other, error), "fixed identity fixture");
     // Independently computed with Python hashlib and struct.pack('<Q', length).
     check(hex(other) == "f163e269d671c03aadd2dd4206b143ca682709d3e2a16a407bae95a95e2b70b1", "identity uses SHA-256 with framed fields");
+    {
+        // An asset's digest is SHA-256 over a tag, its size, the piece size and each 64 MiB piece's SHA-256, the pieces
+        // hashed on all but one thread (values independently computed with Python hashlib, like the fixture above).
+        auto pattern = [](size_t n, uint64_t mul, unsigned shift) {
+            std::string bytes(n, '\0');
+            for (size_t i = 0; i < n; ++i) bytes[i] = char(uint8_t((uint64_t(i) * mul) >> shift));
+            return bytes;
+        };
+        const auto big = temp.path / "big-weights";
+        write(big, pattern((size_t(130) << 20) + 4097, 2654435761ull, 13));   // three pieces, the last one short
+        ConversationIdentity pieces;
+        check(conversation_identity({{"weights", big}}, {{"settings", "kv=int8"}}, pieces, error) &&
+              hex(pieces) == "e97224cc8d4bbc92932b151245f8a0e6a49069e8d566624bc8ee24f9cd8c97d0",
+              "a file hashed in 64 MiB pieces on several threads");
+        const std::pair<const char*, size_t> sizes[] = {{"a", 1024}, {"b", size_t(9) << 20}, {"c", 3},
+                                                        {"d", (size_t(17) << 20) + 5}, {"e", 0}, {"f", 100 * 1024}};
+        for (const auto& [name, n] : sizes) write(temp.path / name, pattern(n, 2654435761ull + uint64_t(name[0]), 11));
+        const std::vector<ConversationAsset> many = {{"tokenizer", temp.path / "c"}, {"weights", temp.path / "d"},
+            {"embedding", temp.path / "b"}, {"draft", temp.path / "a"}, {"template", temp.path / "e"},
+            {"profile", temp.path / "f"}, {"head", temp.path / "d"}};
+        ConversationIdentity concurrent;
+        check(conversation_identity(many, {{"settings", "kv=int8"}}, concurrent, error) &&
+              hex(concurrent) == "9e97cf26d8c28851ae89c056f5b19a1cb7ebd771506f162833aaa75c0cc8b4fc",
+              "files hashed concurrently keep the assets' order and a shared file's digest");
+        auto broken = many;
+        broken[3].path = temp.path / "absent";
+        ConversationIdentity kept = concurrent;
+        check(!conversation_identity(broken, {{"settings", "kv=int8"}}, kept, error) && kept == concurrent &&
+              error.find("absent") != std::string::npos, "a missing file among several fails closed and is named");
+    }
     // Named identity mismatches are rejected before any state payload is read.
     const ConversationSettings settings{{"engine-version", "0.1.30"}, {"geometry", "48"},
         {"expert-quant/0", "IQ3_S"}, {"kv-format", "int8"}, {"kv-resident", "32768"},
