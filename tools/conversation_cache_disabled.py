@@ -173,8 +173,10 @@ def main():
                 for request in results['requests']:
                     generate(request)
         finally:
+            proc = engine.proc  # close() clears engine.proc once the engine has exited (serve 573a55b)
             engine.close()
-            engine.proc.wait(timeout=30)
+            if proc is not None:
+                proc.wait(timeout=30)
             engine.log.close()
         arm['request_digest'] = hashlib.sha256(json.dumps(results['requests'], sort_keys=True).encode()).hexdigest()
         log_text = log.read_text(encoding='utf-8')

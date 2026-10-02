@@ -144,8 +144,10 @@ def main():
                 for request in results['requests']:
                     generate(request)
         finally:
+            proc = engine.proc  # close() clears engine.proc once the engine has exited (serve 573a55b)
             engine.close()
-            engine.proc.wait(timeout=30)
+            if proc is not None:
+                proc.wait(timeout=30)
             engine.log.close()
         log_text = log.read_text(encoding='utf-8')
         hashes = state_hashes(log_text)

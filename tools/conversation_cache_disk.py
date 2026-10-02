@@ -222,8 +222,10 @@ def main():
             else:
                 generate(continuation, 24, 'return')
         finally:
+            proc = engine.proc  # close() clears engine.proc once the engine has exited (serve 573a55b)
             engine.close()
-            engine.proc.wait(timeout=30)  # close() may have killed a slow child; wait before the next model load
+            if proc is not None:
+                proc.wait(timeout=30)  # close() may have killed a slow child; wait before the next model load
             engine.log.close()
             save()
         text = log.read_text(encoding='utf-8')
