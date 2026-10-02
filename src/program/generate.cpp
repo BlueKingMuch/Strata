@@ -4490,7 +4490,9 @@ int main(int argc, char** argv) {
                 field("arguments", arguments.str());
                 char** environment = nullptr;
 #ifdef _WIN32
-                if (_get_environ(&environment) != 0) throw std::runtime_error("cannot identify engine environment");
+                // MSVC's Universal CRT has no _get_environ; _environ is the narrow table main() gets.
+                environment = _environ;
+                if (environment == nullptr) throw std::runtime_error("cannot identify engine environment");
 #else
                 environment = environ;
 #endif
