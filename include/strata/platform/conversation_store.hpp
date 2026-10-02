@@ -38,6 +38,9 @@ public:
     bool best(const std::vector<int64_t>& prompt, const std::vector<core::ConversationImageKey>& images,
               bool cvec, uint64_t staging_limit, const std::vector<std::filesystem::path>& excluded,
               Candidate& candidate, std::string& error) const;
+    // How many threads read a snapshot's larger spans at once (default 1) while the calling thread hashes them. The
+    // engine leaves the logical processors of its CPU expert pool and its own thread out.
+    void read_threads(unsigned threads);
     // Removes the candidate's file when its contents prove damaged (cut short, malformed or failing the footer),
     // not when the read is only declined (identity, RAM admission, allocation).
     bool read(const Candidate& candidate, uint64_t staging_limit, std::optional<uint64_t> available,
@@ -48,5 +51,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    unsigned read_threads_ = 1;
 };
 } // namespace strata::platform

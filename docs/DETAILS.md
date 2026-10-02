@@ -601,7 +601,10 @@ after restart; corrupt, incompatible or unadmitted entries fall back to ordinary
 prompt processing. A snapshot is a cache entry, so it is handed to the operating system
 without forcing it to the drive (an eviction does not wait for the drive): one that a power
 failure cuts short fails its integrity check when read, is removed, and the prompt is read
-again. Startup hashes model/runtime assets, adding I/O (in 64 MiB pieces on all
+again. A snapshot is read back on the logical processors the CPU expert pool does not compute
+on (all but its workers and the engine's own thread, which checks the SHA-256 of what they read;
+the log names the count), so a restore runs at the drive's speed or the check's, whichever is
+lower. Startup hashes model/runtime assets, adding I/O (in 64 MiB pieces on all
 but one of the CPU's threads, so about one read of the model at the drive's speed); changing assets,
 the executable or bound settings/paths can invalidate reuse. The frontend supplies
 its actual tokenizer/template paths automatically. The v2 envelope preserves the

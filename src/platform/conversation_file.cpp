@@ -8,8 +8,11 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <condition_variable>
+#include <cstdio>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -19,6 +22,13 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
+
+#ifdef _WIN32
+#include <share.h>
+#else
+#include <sys/types.h>
+#endif
 
 namespace strata::platform {
 namespace {
@@ -99,6 +109,34 @@ struct IoProgress {
     void finish() { if (callback) callback(); }
 };
 
+// A file read at given offsets through C stdio, one fread per piece. Not std::ifstream: MSVC's filebuf::xsgetn hands
+// fread 4,095 bytes at a time, so every read became 4 KiB ReadFile calls, about 0.8 GB/s per stream.
+class InputFile {
+public:
+    explicit InputFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+        file_ = _wfsopen(path.c_str(), L"rb", _SH_DENYNO);   // the sharing std::ifstream uses
+#else
+        file_ = std::fopen(path.c_str(), "rb");
+#endif
+    }
+    ~InputFile() { if (file_) std::fclose(file_); }
+    InputFile(const InputFile&) = delete;
+    InputFile& operator=(const InputFile&) = delete;
+    bool is_open() const { return file_ != nullptr; }
+    bool read(uint64_t offset, void* data, size_t count) {
+        if (!file_ || offset > uint64_t(std::numeric_limits<int64_t>::max())) return false;
+#ifdef _WIN32
+        if (_fseeki64(file_, (long long) offset, SEEK_SET) != 0) return false;
+#else
+        if (fseeko(file_, (off_t) offset, SEEK_SET) != 0) return false;
+#endif
+        return std::fread(data, 1, count, file_) == count;
+    }
+private:
+    std::FILE* file_ = nullptr;
+};
+
 // Large spans (state blobs, K/V segments) move in 4 MiB pieces, and one piece is hashed while the stream writes
 // or reads its neighbour, so hashing no longer adds to the time the stream needs. The bytes and the digest are the
 // same as before; only small fields still go through one piece at a time.
@@ -152,13 +190,125 @@ struct Writer {
     }
 };
 
+// Reading a snapshot from a file, its spans of 1 MiB and more are read by reader threads: each 1 MiB piece with one
+// fread from that thread's own handle straight into the image, and hashed in file order on the calling thread as the
+// pieces arrive. One stream read about 0.8 GB/s on Windows; several reach the drive's speed, and the hash (about
+// 2 GB/s with SHA extensions) becomes the limit. The parser still sees the bytes in order, the digest is the same, no
+// second buffer exists, and no read outlives the span it belongs to.
+constexpr size_t kSpanPiece = size_t(1) << 20;
+
+class SpanReader {
+public:
+    using Fragment = std::pair<char*, size_t>;
+    SpanReader(std::filesystem::path path, unsigned threads) : path_(std::move(path)) {
+        try {
+            for (unsigned t = 0; t < threads; ++t) threads_.emplace_back([this] { work(); });
+        } catch (const std::system_error&) {}   // fewer threads; with none, the caller reads the stream itself
+    }
+    ~SpanReader() {
+        { std::lock_guard<std::mutex> lock(mu_); stop_ = true; }
+        work_cv_.notify_all();
+        for (auto& t : threads_) t.join();
+    }
+    SpanReader(const SpanReader&) = delete;
+    SpanReader& operator=(const SpanReader&) = delete;
+    size_t threads() const { return threads_.size(); }
+
+    // Reads the file's bytes from `offset` on into the fragments, which are consecutive in the file, and hands each
+    // piece to in_order on this thread in file order. Every way out waits until no thread is still reading a piece:
+    // the fragments belong to the caller.
+    void read(uint64_t offset, const std::vector<Fragment>& fragments, const std::function<void(const char*, size_t)>& in_order) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            pieces_.clear();
+            for (const auto& [data, n] : fragments)
+                for (size_t done = 0; done < n; done += kSpanPiece) {
+                    const size_t count = std::min(kSpanPiece, n - done);
+                    pieces_.push_back({offset, data + done, count});
+                    offset += count;
+                }
+            state_.assign(pieces_.size(), 0);
+            next_ = 0;
+            abort_ = false;
+        }
+        work_cv_.notify_all();
+        struct Settle {
+            SpanReader& r;
+            ~Settle() {
+                std::unique_lock<std::mutex> lock(r.mu_);
+                r.abort_ = true;   // no further claims
+                r.done_cv_.wait(lock, [&] { return r.busy_ == 0; });
+                r.pieces_.clear(); r.state_.clear(); r.next_ = 0;
+            }
+        } settle{*this};
+        for (size_t i = 0; i < pieces_.size(); ++i) {   // pieces_ only changes before and after the span
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                done_cv_.wait(lock, [&] { return state_[i] != 0; });
+                if (state_[i] != 1) throw std::runtime_error("truncated snapshot");
+            }
+            in_order(pieces_[i].data, pieces_[i].count);
+        }
+    }
+
+private:
+    struct Piece { uint64_t offset; char* data; size_t count; };
+    void work() {
+        std::unique_ptr<InputFile> file;   // opened on the first piece, kept for the read
+        std::unique_lock<std::mutex> lock(mu_);
+        for (;;) {
+            work_cv_.wait(lock, [&] { return stop_ || (!abort_ && next_ < pieces_.size()); });
+            if (stop_) return;
+            const size_t i = next_++;
+            const Piece piece = pieces_[i];
+            ++busy_;
+            lock.unlock();
+            if (!file) file = std::make_unique<InputFile>(path_);
+            const bool ok = file->read(piece.offset, piece.data, piece.count);
+            lock.lock();
+            state_[i] = uint8_t(ok ? 1 : 2);
+            --busy_;
+            done_cv_.notify_all();
+        }
+    }
+    const std::filesystem::path path_;
+    std::mutex mu_;
+    std::condition_variable work_cv_, done_cv_;
+    std::vector<Piece> pieces_;
+    std::vector<uint8_t> state_;   // per piece: 0 not yet read, 1 read, 2 failed
+    size_t next_ = 0, busy_ = 0;   // the next piece to claim; pieces being read
+    bool stop_ = false, abort_ = false;
+    std::vector<std::thread> threads_;
+};
+
 struct Reader {
     std::istream& stream;
     Digest digest;
     uint64_t remaining = 0;
     IoProgress progress;
+    const std::filesystem::path* source = nullptr;   // the file behind the stream, for spans read on several threads
+    unsigned threads = 1;
+    uint64_t offset = 0;                              // where the stream is: the bytes consumed so far
+    std::unique_ptr<SpanReader> spans{};
+
+    bool parallel(size_t n) {
+        if (!source || n < kSpanPiece) return false;
+        if (!spans) spans = std::make_unique<SpanReader>(*source, std::max(1u, threads));
+        return spans->threads() > 0;
+    }
+    // A span read on several threads; the stream then continues after it.
+    void span(const std::vector<SpanReader::Fragment>& fragments, size_t n) {
+        spans->read(offset, fragments, [this](const char* p, size_t count) {
+            digest.update(p, count);
+            progress.advance(count);
+        });
+        offset += n;
+        if (!stream.seekg(std::streamoff(offset))) throw std::runtime_error("truncated snapshot");
+    }
     void bytes(void* p, size_t n) {
         auto* data = static_cast<char*>(p);
+        if (parallel(n)) { span({{data, n}}, n); return; }
+        offset += n;
         if (n >= 2 * kPipelinePiece) {
             const auto fill = [this](char* at, size_t count) { return bool(stream.read(at, std::streamsize(count))); };
             size_t done = 0, count = kPipelinePiece;
@@ -213,6 +363,15 @@ struct Reader {
             const size_t extra = v.bytes() - admitted;
             if (extra > remaining) throw std::runtime_error("snapshot segment capacity exceeds staging bound");
             remaining -= extra;
+        }
+        if (parallel(v.size())) {   // all its segments as one span, so the threads read ahead across them
+            std::vector<SpanReader::Fragment> fragments;
+            v.visit(0, v.size(), [&](uint8_t* p, size_t count, size_t) {
+                fragments.emplace_back(reinterpret_cast<char*>(p), count);
+                return true;
+            });
+            span(fragments, v.size());
+            return;
         }
         v.visit(0, v.size(), [&](uint8_t* p, size_t count, size_t) { bytes(p,count); return true; });
     }
@@ -497,14 +656,15 @@ bool conversation_file_size(const SavedConversation& image, const ConversationId
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
 
-bool conversation_file_read(std::istream& stream, const ConversationIdentity& identity,
-                            uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
-                            SavedConversation& output, std::string& error, ConversationIoProgress progress,
-                            bool* damaged) {
+namespace {
+bool read_image(std::istream& stream, const std::filesystem::path* source, unsigned threads,
+                const ConversationIdentity& identity, uint64_t staging_limit, std::optional<uint64_t> available,
+                uint64_t floor, SavedConversation& output, std::string& error, ConversationIoProgress progress,
+                bool* damaged) {
     bool admitted = false;   // past this point a failure is the file's, not the reader's circumstances
     if (damaged) *damaged = false;
     try {
-        Reader r{stream, {}, 0, {progress}};
+        Reader r{stream, {}, 0, {progress}, source, threads};
         std::array<uint8_t, 8> tag;
         r.bytes(tag.data(), tag.size());
         if (tag != magic) throw std::runtime_error("unsupported conversation snapshot format");
@@ -546,6 +706,24 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
         if (damaged) *damaged = admitted && dynamic_cast<const std::bad_alloc*>(&e) == nullptr;
         return false;
     }
+}
+} // namespace
+
+bool conversation_file_read(std::istream& stream, const ConversationIdentity& identity,
+                            uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
+                            SavedConversation& output, std::string& error, ConversationIoProgress progress,
+                            bool* damaged) {
+    return read_image(stream, nullptr, 1, identity, staging_limit, available, floor, output, error, progress, damaged);
+}
+
+bool conversation_file_read(const std::filesystem::path& path, unsigned threads, const ConversationIdentity& identity,
+                            uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
+                            SavedConversation& output, std::string& error, ConversationIoProgress progress,
+                            bool* damaged) {
+    if (damaged) *damaged = false;
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) { error = "cannot open snapshot"; return false; }
+    return read_image(stream, &path, threads, identity, staging_limit, available, floor, output, error, progress, damaged);
 }
 
 bool conversation_file_match(std::istream& stream, const ConversationIdentity& identity,

@@ -198,6 +198,38 @@ int main() {
     check(other.open(other_root, {}, size * 3, 3, error), "recover interrupted write directory");
     check(!fs::exists(interrupted) && fs::exists(unrelated), "cleanup removes only managed temporary files");
 
+    {
+        // Larger spans read on several threads (1 MiB and more): the same image as one stream, and a damaged file is
+        // still removed.
+        const auto threaded_root = temp.path / "threaded";
+        auto large = fixture(60);
+        large.live.gdn.resize((size_t(5) << 20) + 7);
+        for (size_t i = 0; i < large.live.gdn.size(); ++i) large.live.gdn[i] = uint8_t(i * 7 + 1);
+        large.kv[0].k.resize((size_t(3) << 20) + 5, 9);
+        const uint64_t large_size = encoded(large).size();
+        ConversationStore threaded;
+        threaded.read_threads(4);
+        check(threaded.open(threaded_root, {}, large_size * 2, 2, error) && threaded.put(large, error), "spill a multi-megabyte image");
+        ConversationStore::Candidate hit;
+        check(threaded.best({60, 61, 62, 63}, {}, true, 64 << 20, {}, hit, error) && hit.match.tokens == 3,
+              "find the multi-megabyte image");
+        SavedConversation loaded;
+        check(threaded.read(hit, 64 << 20, 128 << 20, 0, loaded, error) && encoded(loaded) == encoded(large),
+              "four reader threads load the image the writer wrote");
+        threaded.read_threads(1);
+        check(threaded.read(hit, 64 << 20, 128 << 20, 0, loaded, error) && encoded(loaded) == encoded(large),
+              "one stream loads the same image");
+        threaded.read_threads(4);
+        {
+            std::fstream file(hit.path, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekg(std::streamoff(large_size / 2)); char bad = 0; file.read(&bad, 1); bad ^= 4;
+            file.seekp(std::streamoff(large_size / 2)); file.write(&bad, 1);
+        }
+        check(!threaded.read(hit, 64 << 20, 128 << 20, 0, loaded, error) && !fs::exists(hit.path),
+              "a damaged span read on several threads removes the snapshot");
+        threaded.close();
+    }
+
     const auto eviction_root = temp.path / "eviction";
     ConversationStore eviction_store;
     check(eviction_store.open(eviction_root, {}, size * 4, 4, error), "prepare RAM eviction tier");

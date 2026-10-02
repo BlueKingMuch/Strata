@@ -4517,6 +4517,16 @@ int main(int argc, char** argv) {
                                             size_t(o.conversation_disk_slots), disk_error,
                                             []() noexcept { strata::core::progress_beat(); }))
                     throw std::runtime_error(disk_error);
+                // A snapshot is read on the logical processors the engine does not compute on: all but the CPU expert
+                // pool's workers and this thread, which hashes what the readers bring in (at least one reader).
+                if (conversation_disk.is_open()) {
+                    const unsigned logical = std::max(1u, std::thread::hardware_concurrency());
+                    const unsigned workers = o.no_pool ? 0u : unsigned(std::max(0, pool.workers()));
+                    const unsigned readers = logical > workers + 1 ? logical - workers - 1 : 1u;
+                    conversation_disk.read_threads(readers);
+                    std::fprintf(stderr, "strata serve: disk cache: reads snapshots on %u threads (%u logical processors, "
+                                 "%u expert-pool workers, 1 engine thread)\n", readers, logical, workers);
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata serve: disk cache initialization failed: %s\n", e.what());
                 return 1;

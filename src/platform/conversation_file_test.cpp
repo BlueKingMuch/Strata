@@ -190,6 +190,51 @@ int main() {
             check(!conversation_file_read(damaged, id, staging, staging + 17, 17, out, error),
                   "a changed byte in a pipelined span fails the read");
         }
+
+        // The same file read from disk with its spans on several threads: the image is the stream's, for any thread
+        // count, and the file is only ever damaged, never misread - every changed byte, cut and decline is seen alike.
+        TempDirectory files;
+        auto snapshot = large;
+        snapshot.live.ple.resize((size_t(1) << 20) - 1, 3);   // just below the reader threads' threshold
+        snapshot.live.tails.resize(size_t(1) << 20, 4);        // exactly at it
+        snapshot.checkpoints[0].gdn.resize((size_t(5) << 20) + 1, 5);
+        const auto on_disk = encode(snapshot, id);
+        const auto file = files.path / "snapshot";
+        write(file, on_disk);
+        const auto file_staging = integer(on_disk, 48);
+        for (const unsigned threads : {0u, 1u, 2u, 3u, 8u, 16u}) {
+            SavedConversation out;
+            bool damaged = true;
+            heartbeats = 0;
+            check(conversation_file_read(file, threads, id, file_staging, file_staging + 17, 17, out, error, heartbeat, &damaged) &&
+                  same(snapshot, out) && !damaged && heartbeats > 10, "spans read on several threads give the stream's image");
+        }
+        for (const size_t at : {size_t(60), on_disk.size() / 7, on_disk.size() / 3, on_disk.size() / 2, on_disk.size() * 3 / 4,
+                                on_disk.size() - 33, on_disk.size() - 1}) {
+            auto changed = on_disk;
+            changed[at] = char(changed[at] ^ 0x21);
+            write(file, changed);
+            SavedConversation out = source;
+            bool damaged = false;
+            check(!conversation_file_read(file, 8, id, file_staging, file_staging + 17, 17, out, error, nullptr, &damaged) &&
+                  damaged && same(out, source), "a changed byte read on several threads is damage and leaves the image");
+        }
+        for (const size_t cut : {size_t(100), on_disk.size() / 5, on_disk.size() / 2, on_disk.size() - 1}) {
+            write(file, on_disk.substr(0, cut));
+            SavedConversation out;
+            bool damaged = false;
+            check(!conversation_file_read(file, 8, id, file_staging, file_staging + 17, 17, out, error, nullptr, &damaged) &&
+                  damaged, "a file cut short is damage on several threads too");
+        }
+        write(file, on_disk);
+        {
+            SavedConversation out;
+            bool damaged = true;
+            check(!conversation_file_read(file, 8, id, file_staging - 1, file_staging + 17, 17, out, error, nullptr, &damaged) &&
+                  !damaged, "a staging decline from a file is not damage");
+            check(!conversation_file_read(files.path / "absent", 8, id, file_staging, file_staging + 17, 17, out, error, nullptr,
+                                          &damaged) && !damaged && error == "cannot open snapshot", "a missing file is not damage");
+        }
     }
     // A decline for the reader's circumstances (staging budget, RAM floor, unknown RAM, another identity) leaves the
     // file alone; once admitted, anything wrong with the contents marks it damaged, so the store can remove it.

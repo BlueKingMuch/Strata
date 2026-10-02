@@ -289,18 +289,18 @@ bool ConversationStore::read(const Candidate& candidate, uint64_t staging_limit,
     try {
         if (!impl_ || !impl_->owns(candidate)) throw std::runtime_error("snapshot candidate is unavailable");
         bool damaged = false;
-        {
-            std::ifstream file(candidate.path, std::ios::binary);
-            if (conversation_file_read(file, impl_->identity, staging_limit, available, floor, image, error,
-                                       impl_->progress, &damaged))
-                return true;
-        }   // closed first: Windows cannot remove a file that is still open
-        // Cut short or otherwise inconsistent: kept, it would match the same prompts again and be read in full each time.
+        if (conversation_file_read(candidate.path, read_threads_, impl_->identity, staging_limit, available, floor,
+                                   image, error, impl_->progress, &damaged))
+            return true;
+        // Its handles are closed by now (Windows cannot remove an open file). Cut short or otherwise inconsistent: kept,
+        // it would match the same prompts again and be read in full each time.
         std::error_code ec;
         if (damaged && fs::remove(candidate.path, ec)) error += " (snapshot removed)";
         return false;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
+
+void ConversationStore::read_threads(unsigned threads) { read_threads_ = std::max(1u, threads); }
 
 bool ConversationStore::touch(const Candidate& candidate, std::string& error) {
     try {

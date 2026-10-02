@@ -51,6 +51,13 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
                             uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
                             core::SavedConversation& output, std::string& error, ConversationIoProgress progress = nullptr,
                             bool* damaged = nullptr);
+// The same from a snapshot file: spans of 1 MiB and more are read on `threads` threads at once (at least one), each
+// piece from the thread's own handle straight into the image, and hashed in file order on the calling thread. Same
+// result, declines and damaged flag as the stream form.
+bool conversation_file_read(const std::filesystem::path& path, unsigned threads, const ConversationIdentity& identity,
+                            uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
+                            core::SavedConversation& output, std::string& error, ConversationIoProgress progress = nullptr,
+                            bool* damaged = nullptr);
 
 struct ConversationFileMatch {
     int64_t tokens = 0;
