@@ -1,11 +1,11 @@
 // src/prefill/gdn_rec_parity.cu - the prompt path's DeltaNet recurrence, bit for bit and timed.
 //
 // src/prefill/kernels.cu runs gdn_rec_kh_kernel (the three value heads that share a key head in one thread, the
-// inputs staged in blocks of 8 tokens) on CUDA sm_80+ cards that hold all 64 of its blocks at once and do not have 48
-// to 63 SMs (a draw there, see fewer_sms), and gdn_rec_cols_pipe_kernel elsewhere and with STRATA_GDN_KEYHEAD=0.
-// Both are copied below verbatim, with the output norm (gdn_out_norm_kernel) and the norm as it was before, which also
-// stored the normalized value in FP32 although nothing reads it.  The two recurrences do the same arithmetic in the
-// same order per value head and column, so the output, the state after it and the FP16 output must be the same bits.
+// inputs staged in blocks of 8 tokens) on CUDA sm_80+ cards that hold all 64 of its blocks at once, and
+// gdn_rec_cols_pipe_kernel elsewhere and with STRATA_GDN_KEYHEAD=0.  Both are copied below verbatim, with the output
+// norm (gdn_out_norm_kernel) and the norm as it was before, which also stored the normalized value in FP32 although
+// nothing reads it.  The two recurrences do the same arithmetic in the same order per value head and column, so the
+// output, the state after it and the FP16 output must be the same bits.
 //
 // Synthetic inputs of the model's shape (q/k L2-normalized per key head as gdn_l2_kernel leaves them), no model.
 //   gdn_rec_parity            the bit checks (T from 1 to 4099, a non-zero state as after an earlier chunk)
@@ -620,10 +620,6 @@ void scale(int64_t T) {
     cudaEventDestroy(e1);
 }
 
-// as gdn_keyhead_ok in kernels.cu decides by the SM count: gdn_rec_kh_kernel where its busiest SM has one block, or
-// the busiest SM of the kernel before five and more (not 2 against at most 4, 48 to 63 SMs)
-bool engine_takes_keyhead(int sms) { return (HK * NCB + sms - 1) / sms == 1 || (HV * NCB + sms - 1) / sms >= 5; }
-
 // The engine's grids on N of this card's SMs.  scale() puts as many blocks on every SM as the busiest SM of a card with
 // N SMs gets; on that card only some SMs get that many (192 blocks on 80 SMs: 3 on 32 SMs, 2 on the other 48), the
 // rest of the card has less to do, and the estimate came out 4-9 % above the real launch on two cards.  Here the
@@ -853,15 +849,14 @@ void fewer_sms(int64_t T) {
         }
         char range[32];
         std::snprintf(range, sizeof range, "%d-%d SMs", bd[0], bd[1]);
-        const char* keep = engine_takes_keyhead(bd[0]) ? "" : "; the engine keeps the kernel before";
         if (cnt > 0)
-            std::printf("    %-12s before %d / new %d per SM: %.2fx to %.2fx (%d to %d SMs)%s\n", range, b0, b1, lo, hi,
-                        nmin, nmax, keep);
+            std::printf("    %-12s before %d / new %d per SM: %.2fx to %.2fx (%d to %d SMs)\n", range, b0, b1, lo, hi, nmin,
+                        nmax);
         else if (bd[0] > sms)
             std::printf("    %-12s before %d / new %d per SM: more SMs than this card has (see the estimate above)\n", range,
                         b0, b1);
         else
-            std::printf("    %-12s before %d / new %d per SM: not measured%s\n", range, b0, b1, keep);
+            std::printf("    %-12s before %d / new %d per SM: not measured\n", range, b0, b1);
     }
     done();
 }
