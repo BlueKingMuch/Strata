@@ -45,9 +45,12 @@ bool conversation_file_size(const core::SavedConversation& image, const Conversa
 // Reads directly into one staged image; no second whole-file buffer. Budget covers
 // vector payload/capacity and a fixed codec allowance, not allocator/RSS overhead.
 // Unknown RAM telemetry declines admission; failure leaves output unchanged.
+// *damaged (optional) tells a file whose contents are inconsistent once admitted (cut short, malformed, failing the
+// footer) from a read that was only declined (format tag, identity, RAM admission, allocation).
 bool conversation_file_read(std::istream& stream, const ConversationIdentity& identity,
                             uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
-                            core::SavedConversation& output, std::string& error, ConversationIoProgress progress = nullptr);
+                            core::SavedConversation& output, std::string& error, ConversationIoProgress progress = nullptr,
+                            bool* damaged = nullptr);
 
 struct ConversationFileMatch {
     int64_t tokens = 0;

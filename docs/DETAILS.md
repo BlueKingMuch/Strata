@@ -598,7 +598,10 @@ it against another writer. Files contain conversation content. Snapshots are wri
 only when evicted from RAM, not on every turn or shutdown: the latest active turn is
 not guaranteed to survive a restart. Matching persisted entries can be restored
 after restart; corrupt, incompatible or unadmitted entries fall back to ordinary
-prompt processing. Startup hashes model/runtime assets, adding I/O (in 64 MiB pieces on all
+prompt processing. A snapshot is a cache entry, so it is handed to the operating system
+without forcing it to the drive (an eviction does not wait for the drive): one that a power
+failure cuts short fails its integrity check when read, is removed, and the prompt is read
+again. Startup hashes model/runtime assets, adding I/O (in 64 MiB pieces on all
 but one of the CPU's threads, so about one read of the model at the drive's speed); changing assets,
 the executable or bound settings/paths can invalidate reuse. The frontend supplies
 its actual tokenizer/template paths automatically. The v2 envelope preserves the

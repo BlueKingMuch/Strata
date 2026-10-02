@@ -11,19 +11,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 namespace {
-int fail_sync = 0;
 bool fail_write = false, fail_rename = false, crash_write = false, crash_rename = false;
 std::filesystem::path observed_directory;
 uint64_t peak_bytes = 0;
 size_t peak_entries = 0;
 }
-extern "C" int __real_fsync(int);
 extern "C" size_t __real_fwrite(const void*, size_t, size_t, FILE*);
 extern "C" int __real_rename(const char*, const char*);
-extern "C" int __wrap_fsync(int fd) {
-    if (fail_sync && --fail_sync == 0) { errno = EIO; return -1; }
-    return __real_fsync(fd);
-}
 extern "C" size_t __wrap_fwrite(const void* data, size_t width, size_t count, FILE* file) {
     if (fail_write) { errno = ENOSPC; return 0; }
     const auto result = __real_fwrite(data, width, count, file);
@@ -148,6 +142,7 @@ int main() {
     check(!store.read(selected, selected.match.staging_bytes - 1, 1 << 21, 0, image, error), "staging budget enforced again on read");
     check(!store.read(selected, 1 << 20, selected.match.staging_bytes + 9, 10, image, error), "physical floor applies to staged read");
     check(encoded(image) == encoded(a), "failed reads leave caller image unchanged");
+    check(fs::exists(selected.path), "declined reads keep the snapshot");
     check(store.put(b, error) && store.put(c, error), "fill entry quota");
     const auto time = fs::file_time_type::clock::now();
     fs::last_write_time(selected.path, time - std::chrono::hours(3));
@@ -189,6 +184,9 @@ int main() {
         file.seekp(-1, std::ios::end); file.write(&bad, 1);
     }
     check(!other.read(valid, 1 << 20, 1 << 21, 0, image, error), "corrupt footer refused before promotion");
+    check(!fs::exists(valid.path) && error.find("snapshot removed") != std::string::npos,
+          "damaged snapshot removed, so the same prompt does not read it again");
+    check(best(other, 20).match.tokens == 0, "removed snapshot is no longer a candidate");
     check(other.put(fixture(20, 2), error), "write shorter valid candidate");
     check(best(other, 20, 4, {valid.path}).match.tokens == 2, "failed candidate exclusion exposes next valid prefix");
 
@@ -267,11 +265,11 @@ int main() {
     const auto fault_root = temp.path / "faults";
     ConversationStore faults;
     check(faults.open(fault_root, {}, size * 4, 4, error) && faults.put(a, error), "prepare failure fixture");
-    for (int fault = 0; fault < 4; ++fault) {
-        fail_write = fault == 0; fail_sync = fault == 1 ? 1 : fault == 3 ? 2 : 0; fail_rename = fault == 2;
+    for (int fault = 0; fault < 2; ++fault) {
+        fail_write = fault == 0; fail_rename = fault == 1;
         const bool ok = faults.put(b, error);
-        fail_write = false; fail_sync = 0; fail_rename = false;
-        check(!ok, "write/file-sync/rename/directory-sync failure reported");
+        fail_write = false; fail_rename = false;
+        check(!ok, "write/rename failure reported");
         check(count_files(fault_root, ".snap") == 1 && count_files(fault_root, ".tmp") == 0, "failed publication cleaned up");
         check(best(faults, 10).match.tokens == 3 && best(faults, 20).match.tokens == 0, "failed publication preserves earlier complete image");
     }

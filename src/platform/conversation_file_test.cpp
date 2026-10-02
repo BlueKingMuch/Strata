@@ -77,13 +77,16 @@ uint64_t integer(const std::string& bytes, size_t offset) {
 void set_integer(std::string& bytes, size_t offset, uint64_t n) {
     for (size_t i = 0; i < 8; ++i) bytes.at(offset + i) = char(n >> (i * 8));
 }
+bool last_damaged = false;   // what the last rejected() read said about the file
 void rejected(const std::string& bytes, const ConversationIdentity& id, uint64_t budget = 1 << 20,
               std::optional<uint64_t> available = 1 << 21, uint64_t floor = 0) {
     const auto sentinel = fixture();
     auto output = sentinel;
     std::istringstream stream(bytes, std::ios::binary);
     std::string error;
-    check(!conversation_file_read(stream, id, budget, available, floor, output, error), "invalid file declined");
+    last_damaged = !last_damaged;   // must be set either way
+    check(!conversation_file_read(stream, id, budget, available, floor, output, error, nullptr, &last_damaged),
+          "invalid file declined");
     check(!error.empty(), "decline explains cause");
     check(same(output, sentinel), "decline preserves caller image");
 }
@@ -188,23 +191,32 @@ int main() {
                   "a changed byte in a pipelined span fails the read");
         }
     }
-    rejected(bytes, id, bound - 1);
-    rejected(bytes, id, bound, bound + 16, 17);
-    rejected(bytes, id, bound, std::nullopt);
+    // A decline for the reader's circumstances (staging budget, RAM floor, unknown RAM, another identity) leaves the
+    // file alone; once admitted, anything wrong with the contents marks it damaged, so the store can remove it.
+    rejected(bytes, id, bound - 1); check(!last_damaged, "staging budget decline is not damage");
+    rejected(bytes, id, bound, bound + 16, 17); check(!last_damaged, "RAM floor decline is not damage");
+    rejected(bytes, id, bound, std::nullopt); check(!last_damaged, "unknown RAM decline is not damage");
     rejected(bytes, id, bound, 16, 17);
     rejected(bytes, id, bound, UINT64_MAX, UINT64_MAX);
     auto foreign = id; foreign.digest[0] ^= 1;
-    rejected(bytes, foreign);
-    rejected(bytes + 'x', id);
-    for (size_t n = 0; n < bytes.size(); ++n) rejected(bytes.substr(0, n), id);
+    rejected(bytes, foreign); check(!last_damaged, "another identity is not damage");
+    rejected(bytes + 'x', id); check(last_damaged, "trailing data is damage");
+    const size_t admitted_at = 56;   // magic, identity digest and field count, staging bound
+    for (size_t n = 0; n < bytes.size(); ++n) {
+        rejected(bytes.substr(0, n), id);
+        check(last_damaged == (n >= admitted_at), "a file cut short after admission is damaged");
+    }
     for (size_t i = 0; i < bytes.size(); ++i) {
         auto damaged = bytes; damaged[i] ^= 1; rejected(damaged, id);
+        if (i < 48 || i >= admitted_at) check(last_damaged == (i >= admitted_at), "a changed byte past admission is damage");
     }
     auto corrupt = bytes;
-    set_integer(corrupt, 224, UINT64_MAX); rejected(corrupt, id);
+    set_integer(corrupt, 224, UINT64_MAX); rejected(corrupt, id); check(last_damaged, "impossible token count is damage");
     corrupt = bytes; set_integer(corrupt, 48, UINT64_MAX); rejected(corrupt, id);
+    check(!last_damaged, "a bound beyond the staging limit is declined before admission");
     corrupt = bytes; set_integer(corrupt, 48, kConversationFileWorkspace); rejected(corrupt, id);
-    corrupt = bytes; set_integer(corrupt, 216, 2); rejected(corrupt, id);
+    check(last_damaged, "contents beyond their own bound are damage");
+    corrupt = bytes; set_integer(corrupt, 216, 2); rejected(corrupt, id); check(last_damaged, "invalid steering is damage");
 
     auto unsupported = source; unsupported.live.stage_parts.emplace_back();
     std::ostringstream output;

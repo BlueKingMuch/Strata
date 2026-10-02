@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -498,7 +499,10 @@ bool conversation_file_size(const SavedConversation& image, const ConversationId
 
 bool conversation_file_read(std::istream& stream, const ConversationIdentity& identity,
                             uint64_t staging_limit, std::optional<uint64_t> available, uint64_t floor,
-                            SavedConversation& output, std::string& error, ConversationIoProgress progress) {
+                            SavedConversation& output, std::string& error, ConversationIoProgress progress,
+                            bool* damaged) {
+    bool admitted = false;   // past this point a failure is the file's, not the reader's circumstances
+    if (damaged) *damaged = false;
     try {
         Reader r{stream, {}, 0, {progress}};
         std::array<uint8_t, 8> tag;
@@ -510,6 +514,7 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
             !core::conversation_memory_admit(available, bound, floor))
             throw std::runtime_error("snapshot staging admission denied");
         r.remaining = bound - kConversationFileWorkspace;
+        admitted = true;
         SavedConversation image;
         for (auto& n : image.geometry) n = r.signed_integer();
         image.layer_lo = r.signed_integer(); image.layer_hi = r.signed_integer();
@@ -536,7 +541,11 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
         output = std::move(image);
         r.progress.finish();
         return true;
-    } catch (const std::exception& e) { error = e.what(); return false; }
+    } catch (const std::exception& e) {
+        error = e.what();
+        if (damaged) *damaged = admitted && dynamic_cast<const std::bad_alloc*>(&e) == nullptr;
+        return false;
+    }
 }
 
 bool conversation_file_match(std::istream& stream, const ConversationIdentity& identity,

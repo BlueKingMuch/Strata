@@ -93,31 +93,16 @@ FILE* create_file(const fs::path& path) {
 #endif
     return file;
 }
-void sync_file(FILE* file) {
-    if (std::fflush(file) != 0) system_failure("flush snapshot");
-#ifdef _WIN32
-    if (_commit(_fileno(file)) != 0) system_failure("sync snapshot");
-#else
-    if (fsync(fileno(file)) != 0) system_failure("sync snapshot");
-#endif
-}
+// A snapshot is a cache entry, so it is published without forcing it to the drive (no fsync/_commit, no write-through
+// rename, no directory sync); the operating system writes it back on its own. A power failure or system crash can cut
+// one short: it then fails its integrity check when read, read() removes it and the prompt is read again. A forced
+// write would save that one recomputation at the price of every eviction waiting for the drive.
 void publish(const fs::path& temporary, const fs::path& destination) {
 #ifdef _WIN32
-    if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH))
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(), 0))
         throw std::system_error(GetLastError(), std::system_category(), "publish snapshot");
 #else
     if (::rename(temporary.c_str(), destination.c_str()) != 0) system_failure("publish snapshot");
-#endif
-}
-void sync_directory(const fs::path& directory) {
-#ifndef _WIN32
-    const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) system_failure("open snapshot directory for sync");
-    const int result = fsync(fd), saved = errno;
-    ::close(fd);
-    if (result != 0) { errno = saved; system_failure("sync snapshot directory"); }
-#else
-    (void) directory; // MoveFileExW above requests write-through publication.
 #endif
 }
 } // namespace
@@ -256,14 +241,11 @@ bool ConversationStore::put(const core::SavedConversation& image, std::string& e
         if (!conversation_file_write(stream, image, impl_->identity, error, impl_->progress)) return false;
         if (buffer.remaining()) throw std::runtime_error("snapshot encoded length differs from reservation");
         const auto written = Clock::now();
-        sync_file(file.get());
-        if (std::fclose(file.release()) != 0) system_failure("close snapshot");
-        const auto synced = Clock::now();
+        if (std::fclose(file.release()) != 0) system_failure("close snapshot");   // flushes; a full disk fails here
+        const auto closed = Clock::now();
         publish(temporary.path, target);
-        temporary.path = target; // remove even a published file if directory sync fails
-        sync_directory(impl_->directory);
         temporary.path.clear();
-        impl_->last_put = {ms(started, written), ms(written, synced), ms(synced, Clock::now())};
+        impl_->last_put = {ms(started, written), ms(written, closed), ms(closed, Clock::now())};
         return true;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
@@ -303,11 +285,20 @@ bool ConversationStore::best(const std::vector<int64_t>& prompt, const std::vect
 }
 
 bool ConversationStore::read(const Candidate& candidate, uint64_t staging_limit, std::optional<uint64_t> available,
-                             uint64_t floor, core::SavedConversation& image, std::string& error) const {
+                             uint64_t floor, core::SavedConversation& image, std::string& error) {
     try {
         if (!impl_ || !impl_->owns(candidate)) throw std::runtime_error("snapshot candidate is unavailable");
-        std::ifstream file(candidate.path, std::ios::binary);
-        return conversation_file_read(file, impl_->identity, staging_limit, available, floor, image, error, impl_->progress);
+        bool damaged = false;
+        {
+            std::ifstream file(candidate.path, std::ios::binary);
+            if (conversation_file_read(file, impl_->identity, staging_limit, available, floor, image, error,
+                                       impl_->progress, &damaged))
+                return true;
+        }   // closed first: Windows cannot remove a file that is still open
+        // Cut short or otherwise inconsistent: kept, it would match the same prompts again and be read in full each time.
+        std::error_code ec;
+        if (damaged && fs::remove(candidate.path, ec)) error += " (snapshot removed)";
+        return false;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
 

@@ -4540,10 +4540,10 @@ int main(int argc, char** argv) {
                 else {
                     const auto timing = disk.store->last_put_timing();
                     std::fprintf(stderr, "strata serve: disk cache: spilled %zu tokens bytes=%llu in %.1f ms "
-                                 "(write %.0f ms, sync %.0f ms, publish %.0f ms)\n",
+                                 "(write %.0f ms, close %.0f ms, publish %.0f ms)\n",
                                  image.live.ids.size(), (unsigned long long) file_bytes,
                                  std::chrono::duration<double, std::milli>(Clock::now() - started).count(),
-                                 timing.write_ms, timing.sync_ms, timing.publish_ms);
+                                 timing.write_ms, timing.close_ms, timing.publish_ms);
                 }
             } catch (...) { std::fprintf(stderr, "strata serve: disk cache: dropped eviction (allocation failure)\n"); }
         };

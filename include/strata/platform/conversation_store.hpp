@@ -7,6 +7,7 @@
 namespace strata::platform {
 // Single-writer, synchronous disk tier. Only put() writes a snapshot; the caller
 // invokes it on RAM eviction. No GPU state or automatic per-turn persistence.
+// Snapshots are cache entries: put() publishes one without forcing it to the device.
 class ConversationStore {
 public:
     struct Candidate {
@@ -31,14 +32,16 @@ public:
     bool encoded_size(const core::SavedConversation& image, uint64_t& bytes, std::string& error) const;
     bool put(const core::SavedConversation& image, std::string& error, const Candidate* protected_entry = nullptr);
     // How the last successful put() spent its time, for the engine log: encoding (hashing and handing the bytes to
-    // the file), forcing them to the device, and publishing the file under its final name.
-    struct PutTiming { double write_ms = 0, sync_ms = 0, publish_ms = 0; };
+    // the file), closing the file, and publishing it under its final name. Nothing is forced to the device.
+    struct PutTiming { double write_ms = 0, close_ms = 0, publish_ms = 0; };
     PutTiming last_put_timing() const;
     bool best(const std::vector<int64_t>& prompt, const std::vector<core::ConversationImageKey>& images,
               bool cvec, uint64_t staging_limit, const std::vector<std::filesystem::path>& excluded,
               Candidate& candidate, std::string& error) const;
+    // Removes the candidate's file when its contents prove damaged (cut short, malformed or failing the footer),
+    // not when the read is only declined (identity, RAM admission, allocation).
     bool read(const Candidate& candidate, uint64_t staging_limit, std::optional<uint64_t> available,
-              uint64_t floor, core::SavedConversation& image, std::string& error) const;
+              uint64_t floor, core::SavedConversation& image, std::string& error);
     // Call only after shared-core validation and successful promotion.
     bool touch(const Candidate& candidate, std::string& error);
 
