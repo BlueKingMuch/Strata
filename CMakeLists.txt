@@ -60,10 +60,30 @@ option(STRATA_ENABLE_CONVERSATION_DISK "Build the optional disk conversation cac
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_ENABLE_CONVERSATION_DISK)
-  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  if(WIN32 AND NOT DEFINED OPENSSL_USE_STATIC_LIBS)
+    # Windows: linked statically, OpenSSL is needed to build the engine but not to run it (no DLL on PATH or next
+    # to the engine). -DOPENSSL_USE_STATIC_LIBS=OFF links the DLL instead.
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+  endif()
+  find_package(OpenSSL COMPONENTS Crypto)
+  if(NOT TARGET OpenSSL::Crypto)
+    if(WIN32)
+      message(FATAL_ERROR "STRATA_ENABLE_CONVERSATION_DISK needs OpenSSL (for SHA-256). Install it with\n"
+                          "  winget install -e --id ShiningLight.OpenSSL.Dev\n"
+                          "and configure again: CMake finds it in C:/Program Files/OpenSSL-Win64, where that "
+                          "package installs it (installed elsewhere: -DOPENSSL_ROOT_DIR=<folder>).")
+    else()
+      message(FATAL_ERROR "STRATA_ENABLE_CONVERSATION_DISK needs the OpenSSL development files (for SHA-256), "
+                          "e.g. sudo apt install libssl-dev on Debian/Ubuntu; then configure again.")
+    endif()
+  endif()
   add_library(strata_conversation_file STATIC src/platform/conversation_file.cpp src/platform/conversation_store.cpp)
   target_include_directories(strata_conversation_file PUBLIC include)
   target_link_libraries(strata_conversation_file PRIVATE OpenSSL::Crypto)
+  if(WIN32 AND OPENSSL_USE_STATIC_LIBS)
+    # the static library seeds its random generator from CNG (BCryptGenRandom)
+    target_link_libraries(strata_conversation_file PRIVATE bcrypt)
+  endif()
 endif()
 
 if(STRATA_BUILD_CONVERSATION_TESTS)

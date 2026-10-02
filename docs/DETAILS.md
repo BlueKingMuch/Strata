@@ -566,12 +566,13 @@ cmake -S . -B build -DSTRATA_ENABLE_CONVERSATION_DISK=ON
 cmake --build build --target strata -j 2
 ```
 
-On Windows, install x64 OpenSSL development headers and libraries compatible with
-your MSVC build. CMake finds the `Crypto` component through
-[FindOpenSSL](https://cmake.org/cmake/help/latest/module/FindOpenSSL.html); if needed,
-add `-DOPENSSL_ROOT_DIR="C:/path/to/OpenSSL"` to configuration. Build with
-`cmake --build build --config Release --target strata -j 2`. With shared OpenSSL,
-the matching libcrypto DLL must be available at runtime, for example on `PATH`.
+On Windows, install OpenSSL with `winget install -e --id ShiningLight.OpenSSL.Dev`
+(the package with headers and libraries; it goes to `C:\Program Files\OpenSSL-Win64`, where
+[FindOpenSSL](https://cmake.org/cmake/help/latest/module/FindOpenSSL.html) looks; installed
+elsewhere, add `-DOPENSSL_ROOT_DIR="C:/path/to/OpenSSL"` to configuration). Build with
+`cmake --build build --config Release --target strata -j 2`. CMake links OpenSSL
+statically there, so the engine needs no OpenSSL DLL at runtime; with
+`-DOPENSSL_USE_STATIC_LIBS=OFF` it links the DLL, which must then be on `PATH`.
 Setup does not install this optional dependency or enable disk caching for you.
 
 The option defaults to `OFF`; ordinary builds have no OpenSSL dependency. In your
