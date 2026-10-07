@@ -931,8 +931,10 @@ list, a compacted history) restores that prefix and leaves the parked
 conversation where it is, so its next turn still resumes in full; the engine
 log says "borrowed". A match on a parked conversation's live state or its newest
 checkpoint is that conversation going on and moves it into the session as
-before. When the outgoing conversation fits only in the parked one's room, it
-keeps its place and the parked one is moved in whole, as before.
+before; so does a match that reaches a pinned shared prefix (`pin=N`), which
+keeps one conversation holding the pin. When the outgoing conversation fits only
+in the parked one's room, it keeps its place and the parked one is moved in
+whole, as before.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 physical-RAM headroom remain available: the engine checks before allocation and

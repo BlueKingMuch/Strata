@@ -261,11 +261,16 @@ public:
     // take() would move the whole conversation into the session and the new request would overwrite everything after
     // that checkpoint, so the other conversation's next turn would read its history again.  A match on the entry's
     // live state or on its deepest checkpoint is the same conversation going on (the deepest one: its client
-    // re-rendered the last reply), whose tail is stale: that is still taken.
+    // re-rendered the last reply), whose tail is stale: that is still taken.  So is a match that reaches a pinned
+    // shared prefix (pin=N): a borrow copies the checkpoints up to the match, and taking it instead keeps one
+    // conversation holding the pin, as pin=N expects.
     bool borrows(const Match& m) const {
         if (m.tokens <= 0 || m.live || m.index >= entries_.size() || serials_[m.index] != m.serial) return false;
         size_t deepest = 0;
-        for (const auto& c : entries_[m.index].checkpoints) deepest = std::max(deepest, c.ids.size());
+        for (const auto& c : entries_[m.index].checkpoints) {
+            if (c.pinned && (int64_t) c.ids.size() <= m.tokens) return false;
+            deepest = std::max(deepest, c.ids.size());
+        }
         return (size_t) m.tokens < deepest;
     }
     // The entry with this identity: its index (SIZE_MAX: gone), or the entry itself (nullptr: gone; the pointer is
@@ -279,12 +284,13 @@ public:
         const size_t i = index_of(serial);
         return i == SIZE_MAX ? nullptr : &entries_[i];
     }
-    // While a borrowed entry is being restored, parking the outgoing conversation must not evict or drop it.  When
-    // the outgoing image fits only without it, make_room refuses before evicting anything and pin_blocked() says so:
-    // the caller then takes the entry as before, so the conversation that was active a moment ago keeps its place.
-    void pin(uint64_t serial) { pinned_ = serial; pin_blocked_ = false; }
-    void unpin() { pinned_ = 0; }
-    bool pin_blocked() const { return pin_blocked_; }
+    // While a borrowed entry (the donor) is being restored, parking the outgoing conversation must not evict or drop
+    // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and
+    // guard_blocked() says so: the caller then takes the entry as before, so the conversation that was active a
+    // moment ago keeps its place.
+    void guard(uint64_t serial) { guarded_ = serial; guard_blocked_ = false; }
+    void unguard() { guarded_ = 0; }
+    bool guard_blocked() const { return guard_blocked_; }
     size_t borrowed() const { return borrowed_; }
     void count_borrow() { ++borrowed_; }
 
@@ -292,18 +298,22 @@ public:
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (const SavedConversation* p = pinned_ != 0 ? find(pinned_) : nullptr) {
-            // with everything else gone, would it fit beside the pinned entry?  If not, evict nothing
-            if (slots_ < 2 || p->bytes() > budget_ - held - incoming) { pin_blocked_ = true; return false; }
+        auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
+        if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
+            // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
+            // shared prefix)?  If not, evict nothing
+            size_t kept = 0, kept_bytes = 0;
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
+            if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that neither holds a pinned shared prefix nor is the pinned (borrowed) entry leaves;
-            // with only those left the new image does not fit (the caller skips parking it - the pinned prefix is
-            // what the queries come back to)
+            // the oldest entry that neither holds a pinned shared prefix nor is the guarded donor leaves; with only
+            // those left the new image does not fit (the caller skips parking it - the pinned prefix is what the
+            // queries come back to)
             size_t victim = 0;
-            while (victim < entries_.size() &&
-                   (entries_[victim].pinned() || (pinned_ != 0 && serials_[victim] == pinned_))) ++victim;
+            while (victim < entries_.size() && stays(victim)) ++victim;
             if (victim == entries_.size()) return false;
             bytes_ -= entries_[victim].bytes();
             erase(victim);
@@ -334,7 +344,7 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
-                !(pinned_ != 0 && serials_[i] == pinned_)) {
+                !(guarded_ != 0 && serials_[i] == guarded_)) {
                 bytes_ -= e.bytes();
                 erase(i);
                 ++dropped;
@@ -366,8 +376,8 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
-    uint64_t next_serial_ = 1, pinned_ = 0;
-    bool pin_blocked_ = false;
+    uint64_t next_serial_ = 1, guarded_ = 0;
+    bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
 };
 
