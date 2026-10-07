@@ -538,8 +538,7 @@ int64_t pool_chunks(const ElasticPool& p, size_t a, int64_t slots) {
     return (int64_t) (((uint64_t) slots * p.per_slot[a] + p.extra[a] + G - 1) / G);
 }
 // A batch slot's state (group 1 or more) keeps its indexer's pooled keys in its elastic range too, one row
-// per idx_block cells.  Only there: the prompt path rounds ALL of a state's pooled rows (its tensor-core block scores),
-// and it runs on the main session only; the windows read rows up to the current block (qsa_select.cu).
+// per idx_block cells.  The main session's and its drafter's stay one block for the whole context, as before.
 bool pooled_elastic(const QsaShapes& s, int mode) {
     return g_kv_elastic && mode == 0 && g_kv_group > 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
 }
